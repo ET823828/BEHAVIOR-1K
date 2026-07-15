@@ -1,6 +1,8 @@
 import cv2
+from collections.abc import Mapping
 import json
 import logging
+import math
 import os
 import sys
 import traceback
@@ -113,6 +115,7 @@ class Evaluator:
         self._video_writer = None
         self._video_path = None
         self._video_rate = 30
+        self._profile_source_observation_id = None
 
     @property
     def should_sync_lights(self) -> bool:
@@ -242,11 +245,66 @@ class Evaluator:
     def load_metrics(self) -> List[MetricBase]:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self) -> Tuple[bool, bool]:
-        self.robot_action = self.policy.forward(obs=self.obs)
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
-        obs = self._sync_lights_and_get_obs(obs)
-        self.obs = self._preprocess_obs(obs)
+    def step(self, profiler: Any | None = None, step_index: int | None = None) -> Tuple[bool, bool]:
+        output_id = None
+        if profiler is None:
+            self.robot_action = self.policy.forward(obs=self.obs)
+        else:
+            if isinstance(step_index, bool) or not isinstance(step_index, int) or step_index < 0:
+                raise ValueError("step_index must be a non-negative integer when profiling is enabled")
+            if step_index == 0:
+                if self._profile_source_observation_id is not None:
+                    raise RuntimeError("profiled episode started with a stale observation id")
+                self._profile_source_observation_id = profiler.record_observation_available(
+                    observation_id="observation-0"
+                )
+            observation_id = self._profile_source_observation_id
+            if observation_id is None:
+                raise RuntimeError("profiled step has no causally preceding processed observation")
+            self._profile_source_observation_id = None
+            output_id = f"action-{step_index}"
+            uses_cached_action = getattr(self.policy, "uses_cached_action", None)
+            cached_action = bool(uses_cached_action(self.obs)) if callable(uses_cached_action) else False
+            stage_name = "client_cached_policy_action" if cached_action else "websocket_policy_round_trip"
+            stage_kind = "cache" if cached_action else "communication_wait"
+            with profiler.stage(stage_name, kind=stage_kind):
+                self.robot_action = profiler.act(
+                    lambda: self.policy.forward(obs=self.obs),
+                    metadata={"boundary": stage_name},
+                    source_observation_id=observation_id,
+                    output_kind="direct_action",
+                    generated_action_count=1,
+                    output_id=output_id,
+                )
+            base_env = getattr(self.env, "env", self.env)
+            action_frequency = float(base_env.env_config["action_frequency"])
+            if not math.isfinite(action_frequency) or action_frequency <= 0:
+                raise ValueError("environment action_frequency must be finite and positive")
+            profiler.record_action_delivery(
+                output_id=output_id,
+                action_index=0,
+                control_period_ms=1000.0 / action_frequency,
+                replan_context={"status": "policy_action_delivery", "generation": step_index},
+            )
+
+        if profiler is None:
+            obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        else:
+            with profiler.stage("omnigibson_environment_step", kind="environment_step"):
+                obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+            profiler.finish_action_execution(output_id=output_id)
+
+        if profiler is None:
+            obs = self._sync_lights_and_get_obs(obs)
+            self.obs = self._preprocess_obs(obs)
+        else:
+            with profiler.stage("challenge_observation_preprocess", kind="observation_preprocess"):
+                obs = self._sync_lights_and_get_obs(obs)
+                self.obs = self._preprocess_obs(obs)
+            if not (terminated or truncated):
+                self._profile_source_observation_id = profiler.record_observation_available(
+                    observation_id=f"observation-{step_index + 1}"
+                )
 
         if self._video_path is not None:
             self._write_video()
@@ -258,6 +316,25 @@ class Evaluator:
 
         for metric in self.metrics:
             metric.step(self.env, self.robot_action, obs, 0.0, terminated, truncated, info)
+        if profiler is not None:
+            step_metadata = {"server_timing_status": "unavailable"}
+            server_timing = getattr(self.policy, "last_server_timing", None)
+            if isinstance(server_timing, Mapping):
+                step_metadata = {
+                    "server_timing_status": "available",
+                    "server_timing": dict(server_timing),
+                }
+            done_info = info.get("done") if isinstance(info, Mapping) else None
+            trace_info = {}
+            if isinstance(done_info, Mapping) and isinstance(done_info.get("success"), bool):
+                trace_info = {"done": {"success": done_info["success"]}}
+            profiler.record_step(
+                info=trace_info,
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+                counters={"step_index": step_index + 1},
+                metadata=step_metadata,
+            )
         return terminated, truncated
 
     @property
@@ -394,6 +471,7 @@ class Evaluator:
             metric.reset(self.env)
         self.policy.reset()
         self.n_success_trials, self.n_trials = 0, 0
+        self._profile_source_observation_id = None
 
     def __enter__(self):
         signal(SIGINT, self._sigint_handler)

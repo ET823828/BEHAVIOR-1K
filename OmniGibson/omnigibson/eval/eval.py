@@ -17,8 +17,10 @@ Example:
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -96,6 +98,40 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Run OmniGibson headless (default: True).",
     )
+    parser.add_argument(
+        "--embodiedperf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable optional EmbodiedPerf system profiling (default: False).",
+    )
+    parser.add_argument(
+        "--embodiedperf-output-dir",
+        default=None,
+        help="Profiler artifact directory. Default: <output-dir>/embodiedperf.",
+    )
+    parser.add_argument(
+        "--embodiedperf-model-key",
+        default=None,
+        help="Stable model identifier recorded in profiler artifacts (required with --embodiedperf).",
+    )
+    parser.add_argument(
+        "--embodiedperf-checkpoint",
+        default=None,
+        help="Checkpoint path or immutable identifier recorded as provenance (required with --embodiedperf).",
+    )
+    parser.add_argument(
+        "--embodiedperf-gpu-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Physical GPU ids included in local power/memory accounting (required with --embodiedperf).",
+    )
+    parser.add_argument(
+        "--embodiedperf-power-interval-s",
+        type=float,
+        default=0.05,
+        help="NVML sampling interval in seconds (default: 0.05).",
+    )
     return parser.parse_args()
 
 
@@ -109,6 +145,36 @@ def main() -> None:
 
     instance_ids = resolve_instance_ids(args.task_name, args.instance_indices, mode=args.mode)
     logger.info(f"Resolved {args.mode} instance ids for {args.task_name}: {instance_ids}")
+
+    profiler = None
+    profile_dir = None
+    if args.embodiedperf:
+        if args.policy != "websocket":
+            raise ValueError("--embodiedperf currently requires --policy websocket")
+        if not args.embodiedperf_model_key:
+            raise ValueError("--embodiedperf-model-key is required with --embodiedperf")
+        if not args.embodiedperf_checkpoint:
+            raise ValueError("--embodiedperf-checkpoint is required with --embodiedperf")
+        if not args.embodiedperf_gpu_ids:
+            raise ValueError("--embodiedperf-gpu-ids is required with --embodiedperf")
+        if len(instance_ids) * args.num_rollouts <= 1:
+            raise ValueError(
+                "EmbodiedPerf excludes the first episode as cold start; select at least two total rollouts"
+            )
+        from omnigibson.eval.profiling import create_behavior_trace_session
+
+        profile_dir = Path(args.embodiedperf_output_dir or Path(args.output_dir) / "embodiedperf")
+        profiler = create_behavior_trace_session(
+            output_dir=profile_dir,
+            model_key=args.embodiedperf_model_key,
+            checkpoint=args.embodiedperf_checkpoint,
+            gpu_ids=args.embodiedperf_gpu_ids,
+            task_name=args.task_name,
+            policy_name=args.policy,
+            host=args.host,
+            port=args.port,
+            power_interval_s=args.embodiedperf_power_interval_s,
+        )
 
     robot_config = None
     if args.robot_config is not None:
@@ -162,16 +228,52 @@ def main() -> None:
                     evaluator.reset()
                     if args.write_video:
                         evaluator.start_recording(video_path, rate=args.video_fps)
-                    terminated = truncated = False
-                    steps = 0
-                    while not (terminated or truncated):
-                        terminated, truncated = evaluator.step()
-                        steps += 1
+                    episode_context = (
+                        profiler.episode(
+                            task=f"{args.task_name}/instance-{instance_id}",
+                            seed=seed,
+                            init_id=int(instance_id),
+                            task_config=f"{args.mode}/instance-{instance_id}",
+                            metadata={
+                                "instance_id": int(instance_id),
+                                "rollout_id": rollout_id,
+                                "mode": args.mode,
+                            },
+                        )
+                        if profiler is not None
+                        else nullcontext()
+                    )
+                    with episode_context:
+                        terminated = truncated = False
+                        steps = 0
+                        while not (terminated or truncated):
+                            terminated, truncated = evaluator.step(profiler=profiler, step_index=steps)
+                            steps += 1
 
-                    success = bool(evaluator.env.task.success)
-                    metrics = {}
-                    for metric in evaluator.metrics:
-                        metrics.update(metric.aggregate(evaluator.env))
+                        if profiler is not None:
+                            profiler.finish_measurement()
+                        success = bool(evaluator.env.task.success)
+                        metrics = {}
+                        for metric in evaluator.metrics:
+                            metrics.update(metric.aggregate(evaluator.env))
+                        if profiler is not None:
+                            q_score_final = metrics.get("q_score", {}).get("final")
+                            if q_score_final is not None:
+                                q_score_final = float(q_score_final)
+                                if not math.isfinite(q_score_final):
+                                    raise ValueError("q_score.final must be finite when profiling is enabled")
+                            profiler.end(
+                                success=success,
+                                info={
+                                    "instance_id": int(instance_id),
+                                    "rollout_id": rollout_id,
+                                    "steps": steps,
+                                    "terminated": bool(terminated),
+                                    "truncated": bool(truncated),
+                                    "q_score_final": q_score_final,
+                                },
+                                failure_mode=None if success else "challenge_episode_unsuccessful",
+                            )
 
                     result = {
                         "task": args.task_name,
@@ -202,6 +304,28 @@ def main() -> None:
     n_success = sum(r["success"] for r in results)
     mean_q = (sum(r.get("q_score", {}).get("final", 0.0) for r in results) / n) if n else 0.0
     logger.info(f"Eval summary: {n_success}/{n} success | mean q_score={mean_q:.3f} | task={args.task_name}")
+    if profiler is not None:
+        from omnigibson.eval.profiling import (
+            materialize_cold_start_free_semantic_views,
+            summarize_cold_start_free_profile,
+        )
+
+        assert profile_dir is not None
+        semantic_views = materialize_cold_start_free_semantic_views(
+            profiler.trace_path,
+            output_dir=profile_dir / "semantic_timeline",
+        )
+        summary_path = profile_dir / "summary.json"
+        summary = summarize_cold_start_free_profile(
+            profiler.trace_path,
+            output_path=summary_path,
+            semantic_view_references=semantic_views,
+        )
+        logger.info(
+            "EmbodiedPerf summary: %s warm episode(s), first episode excluded -> %s",
+            summary["coverage"]["warmEpisodes"],
+            summary_path,
+        )
 
 
 if __name__ == "__main__":
