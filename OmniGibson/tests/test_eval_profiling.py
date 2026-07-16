@@ -1,8 +1,10 @@
 from contextlib import contextmanager
 import json
+from types import SimpleNamespace
 
 import pytest
 
+import omnigibson.eval.eval as eval_runner
 import omnigibson.eval.profiling as behavior_profiling
 from omnigibson.eval.evaluator import Evaluator
 from omnigibson.eval.profiling import (
@@ -10,7 +12,7 @@ from omnigibson.eval.profiling import (
     materialize_cold_start_free_semantic_views,
     summarize_cold_start_free_profile,
 )
-from omnigibson.eval.utils.network_utils import _normalize_server_timing
+from omnigibson.eval.utils.network_utils import _normalize_action_provenance, _normalize_server_timing
 
 
 def _trace(run_id, *, success, episode_ms, energy_j, l0_ms, infer_ms):
@@ -30,7 +32,17 @@ def _trace(run_id, *, success, episode_ms, energy_j, l0_ms, infer_ms):
                     }
                 ]
             },
-            "step_records": [{"metadata": {"server_timing": {"infer_ms": infer_ms}}}],
+            "step_records": [
+                {
+                    "metadata": {
+                        "server_timing": {"infer_ms": infer_ms},
+                        "action_provenance": {
+                            "schema": "b1k_action_provenance_v1",
+                            "status": "current_observation_used",
+                        },
+                    }
+                }
+            ],
             "episode_timeline_artifacts_v1": {"schema": "episode_timeline_artifacts_v1"},
         },
     }
@@ -53,6 +65,7 @@ def test_summary_excludes_first_episode_from_every_statistic(tmp_path):
     assert summary["metrics"]["successfulEpisodeLatencyMs"]["mean"] == 1200.0
     assert summary["metrics"]["successfulEpisodeEnergyJ"]["mean"] == 12.0
     assert summary["metrics"]["serverWrapperActMs"]["mean"] == 20.0
+    assert summary["metrics"]["serverCurrentObservationActMs"]["mean"] == 20.0
 
 
 def test_summary_fails_when_no_warm_episode_remains(tmp_path):
@@ -154,6 +167,52 @@ def test_server_timing_accepts_known_finite_durations():
     }
 
 
+def _provenance(**overrides):
+    value = {
+        "schema": "b1k_action_provenance_v1",
+        "status": "current_observation_used",
+        "inference_executed": True,
+        "request_index": 2,
+        "source_request_index": 2,
+        "plan_id": 1,
+        "action_index_in_plan": 0,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_action_provenance_accepts_consistent_causal_declaration():
+    assert _normalize_action_provenance(_provenance()) == _provenance()
+    cached = _provenance(
+        status="current_observation_not_used",
+        inference_executed=False,
+        request_index=3,
+        source_request_index=2,
+        action_index_in_plan=1,
+    )
+    assert _normalize_action_provenance(cached) == cached
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {},
+        _provenance(inference_executed=False),
+        _provenance(source_request_index=3),
+        _provenance(
+            status="current_observation_not_used",
+            inference_executed=False,
+            source_request_index=2,
+        ),
+        _provenance(request_index=True),
+        _provenance(status="unknown"),
+    ],
+)
+def test_action_provenance_rejects_missing_or_inconsistent_declaration(value):
+    assert _normalize_action_provenance(value) is None
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -182,6 +241,7 @@ def test_trace_session_factory_rejects_ambiguous_resource_scope(tmp_path, overri
 class _FakePolicy:
     def __init__(self):
         self.last_server_timing = {"infer_ms": 4.0}
+        self.last_action_provenance = _provenance(request_index=0, source_request_index=0, plan_id=0)
 
     def forward(self, obs):
         return "action"
@@ -191,9 +251,16 @@ class _CachedPolicy(_FakePolicy):
     def __init__(self):
         self.last_action = "action"
         self.last_server_timing = None
+        self.last_action_provenance = None
 
     def uses_cached_action(self, obs):
         return not obs["need_new_action"] and self.last_action is not None
+
+
+class _MissingProvenancePolicy(_FakePolicy):
+    def __init__(self):
+        super().__init__()
+        self.last_action_provenance = None
 
 
 class _FakeEnv:
@@ -229,8 +296,20 @@ class _FakeProfiler:
         self.events.append(("act", kwargs))
         return fn()
 
+    def capture_action_event_timestamp_ms(self):
+        self.events.append("capture_ready_timestamp")
+        return 123.0
+
+    def record_action_ready(self, **kwargs):
+        self.events.append(("readiness_available", kwargs))
+        return kwargs["output_id"]
+
     def record_action_delivery(self, **kwargs):
         self.events.append(("delivery", kwargs))
+
+    def record_action_readiness_unavailable(self, **kwargs):
+        self.events.append(("readiness_unavailable", kwargs))
+        return kwargs["output_id"]
 
     def finish_action_execution(self, **kwargs):
         self.events.append(("finish", kwargs))
@@ -285,6 +364,15 @@ def test_evaluator_step_profiles_real_boundaries_without_changing_action():
     assert delivery[1]["control_period_ms"] == 50.0
     step = next(event for event in profiler.events if event[0] == "step")
     assert step[1]["metadata"]["server_timing"] == {"infer_ms": 4.0}
+    assert step[1]["metadata"]["action_provenance"] == _provenance(request_index=0, source_request_index=0, plan_id=0)
+    readiness = next(event for event in profiler.events if event[0] == "readiness_available")
+    assert readiness[1] == {
+        "source_observation_id": "observation-0",
+        "output_kind": "direct_action",
+        "generated_action_count": 1,
+        "output_id": "action-0",
+        "timestamp_ms": 123.0,
+    }
     assert profiler.events.count("observation") == 1
 
 
@@ -309,8 +397,43 @@ def test_evaluator_step_labels_client_cache_without_claiming_websocket_wait():
     assert stage == ("stage", "client_cached_policy_action", "cache")
     act = next(event for event in profiler.events if event[0] == "act")
     assert act[1]["metadata"]["boundary"] == "client_cached_policy_action"
+    assert "source_observation_id" not in act[1]
+    unavailable = next(event for event in profiler.events if event[0] == "readiness_unavailable")
+    assert unavailable[1] == {
+        "output_kind": "direct_action",
+        "generated_action_count": 1,
+        "reason": "unsupported_non_fifo_provenance",
+        "output_id": "action-0",
+    }
     step = next(event for event in profiler.events if event[0] == "step")
-    assert step[1]["metadata"] == {"server_timing_status": "unavailable"}
+    assert step[1]["metadata"] == {
+        "server_timing_status": "unavailable",
+        "action_provenance_status": "unavailable",
+    }
+
+
+def test_evaluator_fails_closed_when_server_omits_action_provenance():
+    evaluator = Evaluator.__new__(Evaluator)
+    evaluator.policy = _MissingProvenancePolicy()
+    evaluator.env = _FakeEnv()
+    evaluator.obs = {"processed": True}
+    evaluator.robot_action = None
+    evaluator._video_path = None
+    evaluator._profile_source_observation_id = None
+    evaluator.n_trials = 0
+    evaluator.n_success_trials = 0
+    evaluator.metrics = [_FakeMetric()]
+    evaluator._sync_lights_and_get_obs = lambda obs: obs
+    evaluator._preprocess_obs = lambda obs: obs
+    profiler = _FakeProfiler()
+
+    evaluator.step(profiler=profiler, step_index=0)
+
+    assert not any(event[0] == "readiness_available" for event in profiler.events if isinstance(event, tuple))
+    unavailable = next(event for event in profiler.events if event[0] == "readiness_unavailable")
+    assert unavailable[1]["reason"] == "unsupported_non_fifo_provenance"
+    step = next(event for event in profiler.events if event[0] == "step")
+    assert step[1]["metadata"]["action_provenance_status"] == "unavailable"
 
 
 class _TwoStepEnv(_FakeEnv):
@@ -343,6 +466,107 @@ def test_evaluator_step_carries_each_processed_observation_to_exactly_one_action
     assert evaluator.step(profiler=profiler, step_index=1) == (True, False)
 
     acts = [event[1] for event in profiler.events if event[0] == "act"]
-    assert [event["source_observation_id"] for event in acts] == ["observation-0", "observation-1"]
-    assert [event["output_id"] for event in acts] == ["action-0", "action-1"]
+    assert all("source_observation_id" not in event and "output_id" not in event for event in acts)
+    readiness = [event[1] for event in profiler.events if event[0] == "readiness_available"]
+    assert [event["source_observation_id"] for event in readiness] == ["observation-0", "observation-1"]
+    assert [event["output_id"] for event in readiness] == ["action-0", "action-1"]
     assert profiler.events.count("observation") == 2
+
+
+def test_main_runs_dedicated_profile_warmup_without_writing_official_result(tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        task_name="turning_on_radio",
+        host="127.0.0.1",
+        port=8000,
+        robot_config=None,
+        instance_indices=[1, 2],
+        mode="public_test",
+        num_rollouts=1,
+        max_steps=1,
+        env_wrapper="fake.Wrapper",
+        policy="websocket",
+        output_dir=str(tmp_path / "results"),
+        write_video=False,
+        video_fps=30,
+        headless=True,
+        embodiedperf=True,
+        embodiedperf_output_dir=str(tmp_path / "profile"),
+        embodiedperf_model_key="model",
+        embodiedperf_checkpoint="checkpoint",
+        embodiedperf_instruction="Turn on the radio.",
+        embodiedperf_gpu_ids=[0],
+        embodiedperf_power_interval_s=0.05,
+        embodiedperf_warmup_instance_index=0,
+    )
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "seed_everything", lambda _seed: 7)
+    monkeypatch.setattr(
+        eval_runner,
+        "resolve_instance_ids",
+        lambda _task, indices, *, mode: [100 + index for index in indices],
+    )
+
+    class FakeProfiler:
+        def __init__(self):
+            self.trace_path = tmp_path / "profile" / "traces.jsonl"
+            self.episodes = []
+            self.ends = []
+
+        @contextmanager
+        def episode(self, **kwargs):
+            self.episodes.append(kwargs)
+            yield
+
+        def finish_measurement(self):
+            return None
+
+        def end(self, **kwargs):
+            self.ends.append(kwargs)
+
+    profiler = FakeProfiler()
+    monkeypatch.setattr(behavior_profiling, "create_behavior_trace_session", lambda **_kwargs: profiler)
+    monkeypatch.setattr(
+        behavior_profiling,
+        "materialize_cold_start_free_semantic_views",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        behavior_profiling,
+        "summarize_cold_start_free_profile",
+        lambda *_args, **_kwargs: {"coverage": {"warmEpisodes": 2}},
+    )
+
+    class FakeEvaluator:
+        loaded_instances = []
+
+        def __init__(self, _cfg):
+            self.env = SimpleNamespace(task=SimpleNamespace(success=True))
+            self.metrics = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def reset(self):
+            return None
+
+        def load_task_instance(self, instance_id):
+            self.loaded_instances.append(instance_id)
+
+        def step(self, **_kwargs):
+            return True, False
+
+    monkeypatch.setattr(eval_runner, "Evaluator", FakeEvaluator)
+
+    eval_runner.main()
+
+    assert FakeEvaluator.loaded_instances == [100, 101, 102]
+    assert [episode["metadata"]["profiler_warmup"] for episode in profiler.episodes] == [True, False, False]
+    assert [episode["instruction"] for episode in profiler.episodes] == ["Turn on the radio."] * 3
+    assert len(profiler.ends) == 3
+    assert sorted((tmp_path / "results" / "json").glob("*.json")) == [
+        tmp_path / "results" / "json" / "turning_on_radio_101_0.json",
+        tmp_path / "results" / "json" / "turning_on_radio_102_0.json",
+    ]

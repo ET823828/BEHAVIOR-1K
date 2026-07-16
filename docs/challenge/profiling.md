@@ -15,24 +15,44 @@ Video encoding remains inside the active loop when `--write-video` is enabled.
 The integration records:
 
 - causal L0 latency from a processed observation being available in the
-  evaluator to the corresponding action being returned by the WebSocket policy;
-- the policy server's reported `policy_wrapper.act` duration when the server
-  returns the standard `server_timing.infer_ms` field;
+  evaluator to the corresponding action becoming available, but only when
+  validated server provenance says that request consumed the current
+  observation;
+- the policy server's reported `policy_wrapper.act` duration for every call,
+  plus a separate current-observation-only distribution, when the response
+  includes `server_timing.infer_ms` and validated action provenance;
 - successful active-rollout latency and energy, average power over all warm
   attempts, peak GPU memory, GPU utilization counters, and evaluator-process CPU;
 - explicit host stages for WebSocket communication, the OmniGibson environment
-  step, challenge observation preprocessing, and client-side cached actions;
+  step, and challenge observation preprocessing; client-side cache stages are
+  added when that optional evaluator cache is enabled;
 - per-episode JSON, static HTML, and Perfetto timeline artifacts.
 
 The first raw trace record in each evaluator invocation is classified as cold
 start and excluded from **all aggregate statistics and published warm-episode
-references**. The raw record is retained for provenance. Consequently, a
-profiled invocation must contain at least two rollouts; the standard ten public
-instances naturally produce one excluded plus nine warm episodes.
+references**. The raw record is retained for provenance. Pass
+`--embodiedperf-warmup-instance-index 0` to run a dedicated, unreported cold
+episode before the selected instances. The standard ten public instances then
+produce eleven raw traces: one excluded warmup plus ten warm, reported episodes.
 
 This cold-start-free profiler summary is a systems view, not the official
 challenge score: the evaluator's normal per-rollout result files remain
 unchanged and retain all selected instances.
+
+Policy action-cache hits, whether implemented in the evaluator or inside the
+policy server, remain visible as executed actions but are marked causally
+unavailable for current-observation L0. A cached action was generated from an
+earlier observation, so its lookup and transport time is not mixed into the
+current observation-to-action-ready distribution.
+
+The profiling extension uses the optional `b1k_action_provenance_v1` response
+object. A fresh inference reports `current_observation_used`; a later action
+drained from the same predicted plan reports `current_observation_not_used`,
+together with its request, source-request, plan, and in-plan action indices.
+Missing, malformed, or contradictory provenance fails closed: the action still
+executes normally, but that call is excluded from causal L0 and counted as
+unknown provenance. The field is profiling metadata only and does not change
+the challenge observation or action format.
 
 ## Scope limits
 
@@ -50,9 +70,9 @@ label either as available from client-side timing.
 
 | Profiling surface | π0.5 | GR00T N1.7 | Current evaluator integration |
 | --- | --- | --- | --- |
-| Causal L0 and active-rollout latency | Supported | Supported | Available |
+| Causal current-observation L0 and active-rollout latency | Supported | Supported | Available with validated provenance |
 | Local GPU power, energy, memory, utilization | Supported | Supported | Available for explicit physical GPU ids |
-| Server wrapper inference duration | Supported | Supported | Available when `server_timing.infer_ms` is returned |
+| Server wrapper duration (all calls and current-observation subset) | Supported | Supported | Available with timing and provenance fields |
 | Evaluator CPU and host-stage timeline | Supported | Supported | Available; policy-server CPU is out of process |
 | Vision/backbone/action-head L2 | JAX/XLA adapter required | Server-side PyTorch markers/hooks required | Not claimed by this client adapter |
 
@@ -82,18 +102,26 @@ CUDA_VISIBLE_DEVICES=0 python -m omnigibson.eval.eval \
   --instance-indices 0 1 2 3 4 5 6 7 8 9 \
   --num-rollouts 1 \
   --output-dir outputs/turning_on_radio \
-  --write-video \
   --embodiedperf \
+  --embodiedperf-warmup-instance-index 0 \
   --embodiedperf-model-key pi05_b1k_turning_on_radio \
   --embodiedperf-checkpoint /absolute/path/to/pi05_turn_on_the_radio \
+  --embodiedperf-instruction "Turn on the radio receiver that's on the table in the living room." \
   --embodiedperf-gpu-ids 0 1
 ```
+
+The dedicated warmup never writes an official result JSON or video. Keep
+`--write-video` disabled for paper-facing latency, CPU, power, and energy runs:
+frame composition and MP4 encoding occur inside the active control loop and
+would otherwise become part of those measurements. Run a separate unprofiled
+invocation when rollout videos are needed.
 
 For the provided GR00T checkpoint, change only the identity fields:
 
 ```bash
   --embodiedperf-model-key groot_n1d7_turning_on_radio \
-  --embodiedperf-checkpoint /absolute/path/to/turning_on_radio_GR00T-checkpoint-150000
+  --embodiedperf-checkpoint /absolute/path/to/turning_on_radio_GR00T-checkpoint-150000 \
+  --embodiedperf-instruction "Turn on the radio receiver that's on the table in the living room."
 ```
 
 Artifacts are written under `<output-dir>/embodiedperf/` by default:
@@ -103,6 +131,7 @@ embodiedperf/
 ├── traces.jsonl                 # all raw episodes, including cold start
 ├── summary.json                 # cold-start-free aggregate contract and metrics
 ├── gpu_profile/                 # per-episode raw GPU samples
+├── cpu_profile/                 # evaluator-process action-window samples
 ├── episode_timeline/            # causal L0 event HTML and Perfetto views
 └── semantic_timeline/           # warm-only host-stage HTML and Perfetto views
 ```

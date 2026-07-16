@@ -120,6 +120,14 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint path or immutable identifier recorded as provenance (required with --embodiedperf).",
     )
     parser.add_argument(
+        "--embodiedperf-instruction",
+        default=None,
+        help=(
+            "Exact language instruction configured on the policy server and recorded in every profile trace "
+            "for provenance (required with --embodiedperf)."
+        ),
+    )
+    parser.add_argument(
         "--embodiedperf-gpu-ids",
         type=int,
         nargs="+",
@@ -131,6 +139,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="NVML sampling interval in seconds (default: 0.05).",
+    )
+    parser.add_argument(
+        "--embodiedperf-warmup-instance-index",
+        type=int,
+        default=None,
+        help=(
+            "Optional split-relative instance index run once as the retained cold-start trace before all reported "
+            "rollouts. It is excluded from result JSONs and every profiler aggregate."
+        ),
     )
     return parser.parse_args()
 
@@ -146,18 +163,35 @@ def main() -> None:
     instance_ids = resolve_instance_ids(args.task_name, args.instance_indices, mode=args.mode)
     logger.info(f"Resolved {args.mode} instance ids for {args.task_name}: {instance_ids}")
 
+    if args.embodiedperf_warmup_instance_index is not None and not args.embodiedperf:
+        raise ValueError("--embodiedperf-warmup-instance-index requires --embodiedperf")
+    warmup_instance_id = None
+    if args.embodiedperf_warmup_instance_index is not None:
+        warmup_instance_id = resolve_instance_ids(
+            args.task_name,
+            [args.embodiedperf_warmup_instance_index],
+            mode=args.mode,
+        )[0]
+
     profiler = None
     profile_dir = None
     if args.embodiedperf:
+        if args.num_rollouts < 1:
+            raise ValueError("--num-rollouts must be at least 1 when profiling is enabled")
         if args.policy != "websocket":
             raise ValueError("--embodiedperf currently requires --policy websocket")
         if not args.embodiedperf_model_key:
             raise ValueError("--embodiedperf-model-key is required with --embodiedperf")
         if not args.embodiedperf_checkpoint:
             raise ValueError("--embodiedperf-checkpoint is required with --embodiedperf")
+        if not isinstance(args.embodiedperf_instruction, str) or not args.embodiedperf_instruction.strip():
+            raise ValueError("--embodiedperf-instruction is required with --embodiedperf")
         if not args.embodiedperf_gpu_ids:
             raise ValueError("--embodiedperf-gpu-ids is required with --embodiedperf")
-        if len(instance_ids) * args.num_rollouts <= 1:
+        raw_episode_count = len(instance_ids) * args.num_rollouts
+        if args.embodiedperf_warmup_instance_index is not None:
+            raw_episode_count += 1
+        if raw_episode_count <= 1:
             raise ValueError(
                 "EmbodiedPerf excludes the first episode as cold start; select at least two total rollouts"
             )
@@ -213,31 +247,45 @@ def main() -> None:
     if args.write_video:
         os.makedirs(video_dir, exist_ok=True)
 
+    evaluated_instances = [(instance_id, False) for instance_id in instance_ids]
+    if profiler is not None and warmup_instance_id is not None:
+        evaluated_instances.insert(0, (warmup_instance_id, True))
+        logger.info(
+            "EmbodiedPerf cold-start warmup: %s index %s -> instance %s",
+            args.mode,
+            args.embodiedperf_warmup_instance_index,
+            warmup_instance_id,
+        )
+
     results = []
     with Evaluator(cfg) as evaluator:
-        for instance_id in instance_ids:
+        for instance_id, is_profiler_warmup in evaluated_instances:
             try:
                 evaluator.reset()
                 evaluator.load_task_instance(int(instance_id))
             except Exception:
                 logger.exception(f"Failed to load task instance {instance_id}.")
                 raise
-            for rollout_id in range(args.num_rollouts):
+            rollout_ids = (-1,) if is_profiler_warmup else range(args.num_rollouts)
+            for rollout_id in rollout_ids:
                 video_path = os.path.join(video_dir, f"{args.task_name}_{instance_id}_{rollout_id}.mp4")
+                record_video = args.write_video and not is_profiler_warmup
                 try:
                     evaluator.reset()
-                    if args.write_video:
+                    if record_video:
                         evaluator.start_recording(video_path, rate=args.video_fps)
                     episode_context = (
                         profiler.episode(
                             task=f"{args.task_name}/instance-{instance_id}",
                             seed=seed,
+                            instruction=args.embodiedperf_instruction,
                             init_id=int(instance_id),
                             task_config=f"{args.mode}/instance-{instance_id}",
                             metadata={
                                 "instance_id": int(instance_id),
                                 "rollout_id": rollout_id,
                                 "mode": args.mode,
+                                "profiler_warmup": is_profiler_warmup,
                             },
                         )
                         if profiler is not None
@@ -267,6 +315,7 @@ def main() -> None:
                                 info={
                                     "instance_id": int(instance_id),
                                     "rollout_id": rollout_id,
+                                    "profiler_warmup": is_profiler_warmup,
                                     "steps": steps,
                                     "terminated": bool(terminated),
                                     "truncated": bool(truncated),
@@ -274,6 +323,15 @@ def main() -> None:
                                 },
                                 failure_mode=None if success else "challenge_episode_unsuccessful",
                             )
+
+                    if is_profiler_warmup:
+                        logger.info(
+                            "EmbodiedPerf cold-start warmup complete: instance=%s steps=%s success=%s",
+                            instance_id,
+                            steps,
+                            success,
+                        )
+                        continue
 
                     result = {
                         "task": args.task_name,
@@ -287,7 +345,7 @@ def main() -> None:
                     with open(out_path, "w") as f:
                         json.dump(result, f, indent=2, default=float)
                     q_score = metrics.get("q_score", {}).get("final")
-                    video_msg = f" | video -> {video_path}" if args.write_video else ""
+                    video_msg = f" | video -> {video_path}" if record_video else ""
                     logger.info(
                         f"Result: instance={instance_id} rollout={rollout_id} steps={steps} "
                         f"success={success} q_score={q_score} -> {out_path}{video_msg}"
@@ -297,35 +355,38 @@ def main() -> None:
                     logger.exception(f"Instance {instance_id} rollout {rollout_id} failed.")
                     raise
                 finally:
-                    if args.write_video:
+                    if record_video:
                         evaluator.stop_recording()
 
-    n = len(results)
-    n_success = sum(r["success"] for r in results)
-    mean_q = (sum(r.get("q_score", {}).get("final", 0.0) for r in results) / n) if n else 0.0
-    logger.info(f"Eval summary: {n_success}/{n} success | mean q_score={mean_q:.3f} | task={args.task_name}")
-    if profiler is not None:
-        from omnigibson.eval.profiling import (
-            materialize_cold_start_free_semantic_views,
-            summarize_cold_start_free_profile,
-        )
+        # OmniGibson's global shutdown terminates the process from Evaluator.__exit__, so all
+        # post-rollout artifacts must be materialized before leaving this context. Measurements
+        # are already closed here, therefore rendering the views cannot pollute episode metrics.
+        n = len(results)
+        n_success = sum(r["success"] for r in results)
+        mean_q = (sum(r.get("q_score", {}).get("final", 0.0) for r in results) / n) if n else 0.0
+        logger.info(f"Eval summary: {n_success}/{n} success | mean q_score={mean_q:.3f} | task={args.task_name}")
+        if profiler is not None:
+            from omnigibson.eval.profiling import (
+                materialize_cold_start_free_semantic_views,
+                summarize_cold_start_free_profile,
+            )
 
-        assert profile_dir is not None
-        semantic_views = materialize_cold_start_free_semantic_views(
-            profiler.trace_path,
-            output_dir=profile_dir / "semantic_timeline",
-        )
-        summary_path = profile_dir / "summary.json"
-        summary = summarize_cold_start_free_profile(
-            profiler.trace_path,
-            output_path=summary_path,
-            semantic_view_references=semantic_views,
-        )
-        logger.info(
-            "EmbodiedPerf summary: %s warm episode(s), first episode excluded -> %s",
-            summary["coverage"]["warmEpisodes"],
-            summary_path,
-        )
+            assert profile_dir is not None
+            semantic_views = materialize_cold_start_free_semantic_views(
+                profiler.trace_path,
+                output_dir=profile_dir / "semantic_timeline",
+            )
+            summary_path = profile_dir / "summary.json"
+            summary = summarize_cold_start_free_profile(
+                profiler.trace_path,
+                output_path=summary_path,
+                semantic_view_references=semantic_views,
+            )
+            logger.info(
+                "EmbodiedPerf summary: %s warm episode(s), first episode excluded -> %s",
+                summary["coverage"]["warmEpisodes"],
+                summary_path,
+            )
 
 
 if __name__ == "__main__":

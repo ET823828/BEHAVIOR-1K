@@ -78,7 +78,7 @@ def create_behavior_trace_session(
         paradigm_default="reactive_vla",
         runtime_mode_default="websocket_closed_loop",
         measurement_method="client_observed_black_box_with_local_system_telemetry",
-        language_conditioned=False,
+        language_conditioned=True,
         required_gpu_evidence=True,
         default_boundary_label="websocket_policy_round_trip",
     )
@@ -303,8 +303,11 @@ def _l0_values(rows: Sequence[Mapping[str, Any]]) -> tuple[list[float], int]:
     return values, unavailable
 
 
-def _server_infer_values(rows: Sequence[Mapping[str, Any]]) -> list[float]:
+def _server_infer_values(rows: Sequence[Mapping[str, Any]]) -> tuple[list[float], list[float], int, int]:
     values = []
+    current_observation_values = []
+    cached_actions = 0
+    unknown_provenance = 0
     for row_index, row in enumerate(rows):
         metadata = row.get("metadata")
         step_records = metadata.get("step_records", []) if isinstance(metadata, Mapping) else []
@@ -315,14 +318,21 @@ def _server_infer_values(rows: Sequence[Mapping[str, Any]]) -> list[float]:
                 raise TypeError(f"traces[{row_index}] step record {step_index} must be an object")
             step_metadata = step.get("metadata")
             timing = step_metadata.get("server_timing") if isinstance(step_metadata, Mapping) else None
+            provenance = step_metadata.get("action_provenance") if isinstance(step_metadata, Mapping) else None
+            provenance_status = provenance.get("status") if isinstance(provenance, Mapping) else None
+            if provenance_status == "current_observation_not_used":
+                cached_actions += 1
+            elif provenance_status != "current_observation_used":
+                unknown_provenance += 1
             if isinstance(timing, Mapping) and timing.get("infer_ms") is not None:
-                values.append(
-                    _finite_float(
-                        timing["infer_ms"],
-                        f"traces[{row_index}].step_records[{step_index}].server_timing.infer_ms",
-                    )
+                infer_ms = _finite_float(
+                    timing["infer_ms"],
+                    f"traces[{row_index}].step_records[{step_index}].server_timing.infer_ms",
                 )
-    return values
+                values.append(infer_ms)
+                if provenance_status == "current_observation_used":
+                    current_observation_values.append(infer_ms)
+    return values, current_observation_values, cached_actions, unknown_provenance
 
 
 def summarize_cold_start_free_profile(
@@ -364,7 +374,12 @@ def summarize_cold_start_free_profile(
     l0_values, unavailable_l0 = _l0_values(warm)
     if not l0_values:
         raise ValueError("warm profile has no available observation-to-action-ready measurements")
-    server_infer_values = _server_infer_values(warm)
+    (
+        server_infer_values,
+        server_current_observation_values,
+        server_cached_actions,
+        server_unknown_provenance,
+    ) = _server_infer_values(warm)
     successful_latency = _optional_values(successful, "episode_time_ms")
     successful_energy = _optional_values(successful, "compute_energy_j")
     average_power = _optional_values(warm, "average_power_w")
@@ -383,6 +398,10 @@ def summarize_cold_start_free_profile(
             "cpuScope": "evaluator_process_only",
             "gpuScope": "explicit_gpu_ids_sampled_by_evaluator_process",
             "serverWrapperActScope": "server-reported policy_wrapper.act duration when available",
+            "serverCurrentObservationActScope": (
+                "server-reported policy_wrapper.act duration only when validated server provenance declares "
+                "that the current observation was consumed"
+            ),
         },
         "coverage": {
             "rawEpisodes": len(rows),
@@ -392,6 +411,9 @@ def summarize_cold_start_free_profile(
             "availableL0Records": len(l0_values),
             "unavailableL0Records": unavailable_l0,
             "serverWrapperActRecords": len(server_infer_values),
+            "serverCurrentObservationActRecords": len(server_current_observation_values),
+            "serverCachedActionRecords": server_cached_actions,
+            "serverUnknownProvenanceRecords": server_unknown_provenance,
         },
         "excludedRunIds": [row["run_id"] for row in excluded],
         "metrics": {
@@ -415,6 +437,11 @@ def summarize_cold_start_free_profile(
                 "count": len(server_infer_values),
                 "mean": _mean(server_infer_values),
                 "p95": _percentile(server_infer_values, 0.95),
+            },
+            "serverCurrentObservationActMs": {
+                "count": len(server_current_observation_values),
+                "mean": _mean(server_current_observation_values),
+                "p95": _percentile(server_current_observation_values, 0.95),
             },
         },
         "warmEpisodes": [

@@ -279,6 +279,7 @@ source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=0 python scripts/b1k/serve_b1k.py \
     --model-path $PATH_TO_CKPT \
     --modality-config-path examples/b1k/r1pro.py \
+    --text-prompt "Turn on the radio receiver that's on the table in the living room." \
     --embodiment-tag NEW_EMBODIMENT \
     --host 127.0.0.1 --port 8000
 ```

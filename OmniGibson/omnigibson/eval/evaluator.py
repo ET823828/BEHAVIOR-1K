@@ -247,6 +247,7 @@ class Evaluator:
 
     def step(self, profiler: Any | None = None, step_index: int | None = None) -> Tuple[bool, bool]:
         output_id = None
+        action_provenance = None
         if profiler is None:
             self.robot_action = self.policy.forward(obs=self.obs)
         else:
@@ -271,9 +272,27 @@ class Evaluator:
                 self.robot_action = profiler.act(
                     lambda: self.policy.forward(obs=self.obs),
                     metadata={"boundary": stage_name},
+                )
+            ready_timestamp_ms = profiler.capture_action_event_timestamp_ms()
+            action_provenance = getattr(self.policy, "last_action_provenance", None)
+            current_observation_used = (
+                not cached_action
+                and isinstance(action_provenance, Mapping)
+                and action_provenance.get("status") == "current_observation_used"
+            )
+            if current_observation_used:
+                profiler.record_action_ready(
                     source_observation_id=observation_id,
                     output_kind="direct_action",
                     generated_action_count=1,
+                    output_id=output_id,
+                    timestamp_ms=ready_timestamp_ms,
+                )
+            else:
+                profiler.record_action_readiness_unavailable(
+                    output_kind="direct_action",
+                    generated_action_count=1,
+                    reason="unsupported_non_fifo_provenance",
                     output_id=output_id,
                 )
             base_env = getattr(self.env, "env", self.env)
@@ -317,13 +336,17 @@ class Evaluator:
         for metric in self.metrics:
             metric.step(self.env, self.robot_action, obs, 0.0, terminated, truncated, info)
         if profiler is not None:
-            step_metadata = {"server_timing_status": "unavailable"}
+            step_metadata = {
+                "server_timing_status": "unavailable",
+                "action_provenance_status": "unavailable",
+            }
             server_timing = getattr(self.policy, "last_server_timing", None)
             if isinstance(server_timing, Mapping):
-                step_metadata = {
-                    "server_timing_status": "available",
-                    "server_timing": dict(server_timing),
-                }
+                step_metadata["server_timing_status"] = "available"
+                step_metadata["server_timing"] = dict(server_timing)
+            if isinstance(action_provenance, Mapping):
+                step_metadata["action_provenance_status"] = "available"
+                step_metadata["action_provenance"] = dict(action_provenance)
             done_info = info.get("done") if isinstance(info, Mapping) else None
             trace_info = {}
             if isinstance(done_info, Mapping) and isinstance(done_info.get("success"), bool):
