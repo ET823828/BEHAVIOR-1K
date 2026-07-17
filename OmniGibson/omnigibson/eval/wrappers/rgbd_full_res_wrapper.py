@@ -1,11 +1,11 @@
-from omnigibson.envs import EnvironmentWrapper, Environment
-from omnigibson.utils.ui_utils import create_module_logger
+from omnigibson.envs import Environment, EnvironmentWrapper
 from omnigibson.eval.utils.eval_utils import (
     HEAD_RESOLUTION,
     WRIST_RESOLUTION,
     get_robot_camera_names,
     set_sensor_modalities,
 )
+from omnigibson.utils.ui_utils import create_module_logger
 
 logger = create_module_logger(module_name=__name__)
 
@@ -37,6 +37,7 @@ class RGBDFullResWrapper(EnvironmentWrapper):
             else:
                 sensor.image_height = WRIST_RESOLUTION[0]
                 sensor.image_width = WRIST_RESOLUTION[1]
-        # reload observation space
-        env.load_observation_space()
-        logger.info("Reloaded observation space!")
+            sensor_space = sensor.load_observation_space()
+            if env.observation_space is not None:
+                env.observation_space.spaces[robot.name].spaces[sensor_name] = sensor_space
+        logger.info("Reloaded camera observation spaces!")
