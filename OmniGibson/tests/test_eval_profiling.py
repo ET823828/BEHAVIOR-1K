@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,267 +7,22 @@ import pytest
 import omnigibson.eval.eval as eval_runner
 import omnigibson.eval.profiling as behavior_profiling
 from omnigibson.eval.evaluator import Evaluator
-from omnigibson.eval.profiling import (
-    create_behavior_trace_session,
-    materialize_cold_start_free_semantic_views,
-    summarize_cold_start_free_profile,
-)
-from omnigibson.eval.utils.network_utils import _normalize_action_provenance, _normalize_server_timing
-
-
-def _trace(run_id, *, success, episode_ms, energy_j, l0_ms, infer_ms):
-    return {
-        "run_id": run_id,
-        "success": success,
-        "episode_time_ms": episode_ms,
-        "compute_energy_j": energy_j,
-        "average_power_w": 100.0,
-        "memory_footprint_mb": 2000.0,
-        "metadata": {
-            "action_readiness_v1": {
-                "records": [
-                    {
-                        "status": "available",
-                        "observation_to_action_ready_ms": l0_ms,
-                    }
-                ]
-            },
-            "step_records": [
-                {
-                    "metadata": {
-                        "server_timing": {"infer_ms": infer_ms},
-                        "action_provenance": {
-                            "schema": "b1k_action_provenance_v1",
-                            "status": "current_observation_used",
-                        },
-                    }
-                }
-            ],
-            "episode_timeline_artifacts_v1": {"schema": "episode_timeline_artifacts_v1"},
-        },
-    }
-
-
-def test_summary_excludes_first_episode_from_every_statistic(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    rows = [
-        _trace("cold", success=False, episode_ms=9999.0, energy_j=999.0, l0_ms=999.0, infer_ms=888.0),
-        _trace("warm", success=True, episode_ms=1200.0, energy_j=12.0, l0_ms=30.0, infer_ms=20.0),
-    ]
-    trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
-    summary = summarize_cold_start_free_profile(trace_path, output_path=tmp_path / "summary.json")
-
-    assert summary["excludedRunIds"] == ["cold"]
-    assert summary["coverage"]["warmEpisodes"] == 1
-    assert summary["metrics"]["successRate"] == 1.0
-    assert summary["metrics"]["l0ObservationToActionReadyMs"]["mean"] == 30.0
-    assert summary["metrics"]["successfulEpisodeLatencyMs"]["mean"] == 1200.0
-    assert summary["metrics"]["successfulEpisodeEnergyJ"]["mean"] == 12.0
-    assert summary["metrics"]["serverWrapperActMs"]["mean"] == 20.0
-    assert summary["metrics"]["serverCurrentObservationActMs"]["mean"] == 20.0
-
-
-def test_summary_fails_when_no_warm_episode_remains(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    trace_path.write_text(
-        json.dumps(_trace("cold", success=False, episode_ms=1.0, energy_j=1.0, l0_ms=1.0, infer_ms=1.0)) + "\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="no warm episode remains"):
-        summarize_cold_start_free_profile(trace_path, output_path=tmp_path / "summary.json")
-
-
-def test_summary_uses_successful_warm_episodes_for_latency_and_energy_only(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    rows = [
-        _trace("cold", success=True, episode_ms=1.0, energy_j=1.0, l0_ms=1.0, infer_ms=1.0),
-        _trace("warm-fail", success=False, episode_ms=9000.0, energy_j=900.0, l0_ms=90.0, infer_ms=80.0),
-        _trace("warm-success", success=True, episode_ms=1200.0, energy_j=12.0, l0_ms=30.0, infer_ms=20.0),
-    ]
-    trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
-    summary = summarize_cold_start_free_profile(trace_path, output_path=tmp_path / "summary.json")
-
-    assert summary["metrics"]["successRate"] == 0.5
-    assert summary["metrics"]["successfulEpisodeLatencyMs"] == {
-        "count": 1,
-        "mean": 1200.0,
-        "p95": 1200.0,
-    }
-    assert summary["metrics"]["successfulEpisodeEnergyJ"] == {"count": 1, "mean": 12.0}
-    assert summary["metrics"]["l0ObservationToActionReadyMs"]["mean"] == 60.0
-
-
-def test_summary_rejects_negative_metric_values(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    rows = [
-        _trace("cold", success=False, episode_ms=1.0, energy_j=1.0, l0_ms=1.0, infer_ms=1.0),
-        _trace("warm", success=True, episode_ms=-1.0, energy_j=1.0, l0_ms=1.0, infer_ms=1.0),
-    ]
-    trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="must be non-negative"):
-        summarize_cold_start_free_profile(trace_path, output_path=tmp_path / "summary.json")
-
-
-def test_semantic_views_are_materialized_for_warm_traces_only(tmp_path, monkeypatch):
-    trace_path = tmp_path / "traces.jsonl"
-    cold = _trace("cold", success=False, episode_ms=1.0, energy_j=1.0, l0_ms=1.0, infer_ms=1.0)
-    warm = _trace("warm", success=True, episode_ms=2.0, energy_j=2.0, l0_ms=2.0, infer_ms=2.0)
-    warm["metadata"]["semantic_stage_v1"] = {"run_id": "warm"}
-    trace_path.write_text(json.dumps(cold) + "\n" + json.dumps(warm) + "\n", encoding="utf-8")
-
-    def derive(collection, **expected):
-        assert collection["run_id"] == expected["expected_run_id"]
-        return {"derived": True}
-
-    def render(collection, **expected):
-        derive(collection, **expected)
-        return "<!doctype html><html></html>\n"
-
-    def build(collection, **expected):
-        derive(collection, **expected)
-        return {"traceEvents": []}
-
-    def serialize(perfetto):
-        return json.dumps(perfetto, sort_keys=True)
-
-    def validate(collection, html, perfetto, **expected):
-        derive(collection, **expected)
-        assert html.endswith("</html>\n")
-        assert perfetto == {"traceEvents": []}
-        return {"status": "pass"}
-
-    monkeypatch.setattr(
-        behavior_profiling,
-        "_semantic_view_functions",
-        lambda: (derive, render, build, serialize, validate),
-    )
-
-    output_dir = tmp_path / "semantic_timeline"
-    references = materialize_cold_start_free_semantic_views(trace_path, output_dir=output_dir)
-
-    assert set(references) == {"warm"}
-    assert not (output_dir / "episode_000001").exists()
-    assert (output_dir / "episode_000002" / "semantic_stage.html").is_file()
-    assert references["warm"]["html"] == "semantic_timeline/episode_000002/semantic_stage.html"
-
-
-@pytest.mark.parametrize("value", [None, {}, {"infer_ms": -1}, {"infer_ms": float("nan")}, {"infer_ms": True}])
-def test_server_timing_rejects_missing_or_malformed_values(value):
-    assert _normalize_server_timing(value) is None
-
-
-def test_server_timing_accepts_known_finite_durations():
-    assert _normalize_server_timing({"infer_ms": 12, "prev_total_ms": 15.5, "ignored": 1}) == {
-        "infer_ms": 12.0,
-        "prev_total_ms": 15.5,
-    }
-
-
-def _provenance(**overrides):
-    value = {
-        "schema": "b1k_action_provenance_v1",
-        "status": "current_observation_used",
-        "inference_executed": True,
-        "request_index": 2,
-        "source_request_index": 2,
-        "plan_id": 1,
-        "action_index_in_plan": 0,
-    }
-    value.update(overrides)
-    return value
-
-
-def test_action_provenance_accepts_consistent_causal_declaration():
-    assert _normalize_action_provenance(_provenance()) == _provenance()
-    cached = _provenance(
-        status="current_observation_not_used",
-        inference_executed=False,
-        request_index=3,
-        source_request_index=2,
-        action_index_in_plan=1,
-    )
-    assert _normalize_action_provenance(cached) == cached
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        None,
-        {},
-        _provenance(inference_executed=False),
-        _provenance(source_request_index=3),
-        _provenance(
-            status="current_observation_not_used",
-            inference_executed=False,
-            source_request_index=2,
-        ),
-        _provenance(request_index=True),
-        _provenance(status="unknown"),
-    ],
-)
-def test_action_provenance_rejects_missing_or_inconsistent_declaration(value):
-    assert _normalize_action_provenance(value) is None
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"gpu_ids": [0, 0]}, "must not contain duplicates"),
-        ({"power_interval_s": True}, "finite positive number"),
-        ({"port": True}, "between 1 and 65535"),
-    ],
-)
-def test_trace_session_factory_rejects_ambiguous_resource_scope(tmp_path, overrides, message):
-    kwargs = {
-        "output_dir": tmp_path / "profile",
-        "model_key": "model",
-        "checkpoint": "checkpoint",
-        "gpu_ids": [0],
-        "task_name": "turning_on_radio",
-        "policy_name": "websocket",
-        "host": "127.0.0.1",
-        "port": 8000,
-    }
-    kwargs.update(overrides)
-
-    with pytest.raises(ValueError, match=message):
-        create_behavior_trace_session(**kwargs)
 
 
 class _FakePolicy:
-    def __init__(self):
-        self.last_server_timing = {"infer_ms": 4.0}
-        self.last_action_provenance = _provenance(request_index=0, source_request_index=0, plan_id=0)
-
     def forward(self, obs):
         return "action"
 
+    def uses_cached_action(self, obs):
+        return False
+
 
 class _CachedPolicy(_FakePolicy):
-    def __init__(self):
-        self.last_action = "action"
-        self.last_server_timing = None
-        self.last_action_provenance = None
-
     def uses_cached_action(self, obs):
-        return not obs["need_new_action"] and self.last_action is not None
-
-
-class _MissingProvenancePolicy(_FakePolicy):
-    def __init__(self):
-        super().__init__()
-        self.last_action_provenance = None
+        return True
 
 
 class _FakeEnv:
-    def __init__(self):
-        self.env = self
-        self.env_config = {"action_frequency": 20}
-
     def step(self, action, n_render_iterations):
         assert action == "action"
         assert n_render_iterations == 1
@@ -283,197 +38,107 @@ class _FakeProfiler:
     def __init__(self):
         self.events = []
 
-    def record_observation_available(self, **kwargs):
-        self.events.append("observation")
-        return kwargs["observation_id"]
-
     @contextmanager
     def stage(self, name, *, kind):
         self.events.append(("stage", name, kind))
         yield
 
-    def act(self, fn, **kwargs):
-        self.events.append(("act", kwargs))
-        return fn()
-
-    def capture_action_event_timestamp_ms(self):
-        self.events.append("capture_ready_timestamp")
-        return 123.0
-
-    def record_action_ready(self, **kwargs):
-        self.events.append(("readiness_available", kwargs))
-        return kwargs["output_id"]
-
-    def record_action_delivery(self, **kwargs):
-        self.events.append(("delivery", kwargs))
-
-    def record_action_readiness_unavailable(self, **kwargs):
-        self.events.append(("readiness_unavailable", kwargs))
-        return kwargs["output_id"]
-
-    def finish_action_execution(self, **kwargs):
-        self.events.append(("finish", kwargs))
-
     def record_step(self, **kwargs):
         self.events.append(("step", kwargs))
 
 
-def test_evaluator_step_without_profiler_preserves_existing_action_path():
+def _evaluator(policy=None):
     evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _FakePolicy()
+    evaluator.policy = policy or _FakePolicy()
     evaluator.env = _FakeEnv()
     evaluator.obs = {"processed": True}
     evaluator.robot_action = None
     evaluator._video_path = None
-    evaluator._profile_source_observation_id = None
     evaluator.n_trials = 0
     evaluator.n_success_trials = 0
     evaluator.metrics = [_FakeMetric()]
     evaluator._sync_lights_and_get_obs = lambda obs: obs
     evaluator._preprocess_obs = lambda obs: {"processed": obs}
+    return evaluator
+
+
+def test_evaluator_step_without_profiler_preserves_existing_action_path():
+    evaluator = _evaluator()
 
     terminated, truncated = evaluator.step()
 
     assert (terminated, truncated) == (True, False)
     assert evaluator.robot_action == "action"
     assert evaluator.obs == {"processed": {"raw": True}}
-    assert evaluator._profile_source_observation_id is None
+    assert evaluator.n_success_trials == 1
 
 
-def test_evaluator_step_profiles_real_boundaries_without_changing_action():
-    evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _FakePolicy()
-    evaluator.env = _FakeEnv()
-    evaluator.obs = {"processed": True}
-    evaluator.robot_action = None
-    evaluator._video_path = None
-    evaluator._profile_source_observation_id = None
-    evaluator.n_trials = 0
-    evaluator.n_success_trials = 0
-    evaluator.metrics = [_FakeMetric()]
-    evaluator._sync_lights_and_get_obs = lambda obs: obs
-    evaluator._preprocess_obs = lambda obs: {"processed": obs}
+def test_evaluator_profiles_only_websocket_and_environment_boundaries():
+    evaluator = _evaluator()
     profiler = _FakeProfiler()
 
     terminated, truncated = evaluator.step(profiler=profiler, step_index=0)
 
     assert (terminated, truncated) == (True, False)
-    assert evaluator.robot_action == "action"
-    assert evaluator.n_success_trials == 1
-    delivery = next(event for event in profiler.events if event[0] == "delivery")
-    assert delivery[1]["control_period_ms"] == 50.0
-    step = next(event for event in profiler.events if event[0] == "step")
-    assert step[1]["metadata"]["server_timing"] == {"infer_ms": 4.0}
-    assert step[1]["metadata"]["action_provenance"] == _provenance(request_index=0, source_request_index=0, plan_id=0)
-    readiness = next(event for event in profiler.events if event[0] == "readiness_available")
-    assert readiness[1] == {
-        "source_observation_id": "observation-0",
-        "output_kind": "direct_action",
-        "generated_action_count": 1,
-        "output_id": "action-0",
-        "timestamp_ms": 123.0,
-    }
-    assert profiler.events.count("observation") == 1
+    assert [event for event in profiler.events if event[0] == "stage"] == [
+        ("stage", "websocket_policy_round_trip", "communication_wait"),
+        ("stage", "omnigibson_environment_step", "environment_step"),
+    ]
+    assert profiler.events[-1] == (
+        "step",
+        {
+            "terminated": True,
+            "truncated": False,
+            "counters": {"step_index": 1},
+        },
+    )
 
 
-def test_evaluator_step_labels_client_cache_without_claiming_websocket_wait():
-    evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _CachedPolicy()
-    evaluator.env = _FakeEnv()
-    evaluator.obs = {"need_new_action": False}
-    evaluator.robot_action = None
-    evaluator._video_path = None
-    evaluator._profile_source_observation_id = None
-    evaluator.n_trials = 0
-    evaluator.n_success_trials = 0
-    evaluator.metrics = [_FakeMetric()]
-    evaluator._sync_lights_and_get_obs = lambda obs: obs
-    evaluator._preprocess_obs = lambda obs: obs
+def test_cached_client_action_is_not_mislabeled_as_websocket_wait():
+    evaluator = _evaluator(_CachedPolicy())
     profiler = _FakeProfiler()
 
     evaluator.step(profiler=profiler, step_index=0)
 
-    stage = next(event for event in profiler.events if event[0] == "stage")
-    assert stage == ("stage", "client_cached_policy_action", "cache")
-    act = next(event for event in profiler.events if event[0] == "act")
-    assert act[1]["metadata"]["boundary"] == "client_cached_policy_action"
-    assert "source_observation_id" not in act[1]
-    unavailable = next(event for event in profiler.events if event[0] == "readiness_unavailable")
-    assert unavailable[1] == {
-        "output_kind": "direct_action",
-        "generated_action_count": 1,
-        "reason": "unsupported_non_fifo_provenance",
-        "output_id": "action-0",
-    }
-    step = next(event for event in profiler.events if event[0] == "step")
-    assert step[1]["metadata"] == {
-        "server_timing_status": "unavailable",
-        "action_provenance_status": "unavailable",
-    }
+    assert [event for event in profiler.events if event[0] == "stage"] == [
+        ("stage", "omnigibson_environment_step", "environment_step")
+    ]
 
 
-def test_evaluator_fails_closed_when_server_omits_action_provenance():
-    evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _MissingProvenancePolicy()
-    evaluator.env = _FakeEnv()
-    evaluator.obs = {"processed": True}
-    evaluator.robot_action = None
-    evaluator._video_path = None
-    evaluator._profile_source_observation_id = None
-    evaluator.n_trials = 0
-    evaluator.n_success_trials = 0
-    evaluator.metrics = [_FakeMetric()]
-    evaluator._sync_lights_and_get_obs = lambda obs: obs
-    evaluator._preprocess_obs = lambda obs: obs
-    profiler = _FakeProfiler()
-
-    evaluator.step(profiler=profiler, step_index=0)
-
-    assert not any(event[0] == "readiness_available" for event in profiler.events if isinstance(event, tuple))
-    unavailable = next(event for event in profiler.events if event[0] == "readiness_unavailable")
-    assert unavailable[1]["reason"] == "unsupported_non_fifo_provenance"
-    step = next(event for event in profiler.events if event[0] == "step")
-    assert step[1]["metadata"]["action_provenance_status"] == "unavailable"
+@pytest.mark.parametrize("step_index", [None, True, -1, 1.5])
+def test_profiled_step_rejects_ambiguous_step_index(step_index):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _evaluator().step(profiler=_FakeProfiler(), step_index=step_index)
 
 
-class _TwoStepEnv(_FakeEnv):
-    def __init__(self):
-        super().__init__()
-        self.step_count = 0
+def test_package_bridge_maps_the_single_sampling_interval(tmp_path, monkeypatch):
+    captured = {}
+    sentinel = object()
 
-    def step(self, action, n_render_iterations):
-        self.step_count += 1
-        terminated = self.step_count == 2
-        return {"raw": self.step_count}, 0.0, terminated, False, {"done": {"success": terminated}}
+    def create(**kwargs):
+        captured.update(kwargs)
+        return sentinel
 
+    monkeypatch.setattr(behavior_profiling, "_embodiedperf_api", lambda: (create, None))
 
-def test_evaluator_step_carries_each_processed_observation_to_exactly_one_action():
-    evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _FakePolicy()
-    evaluator.env = _TwoStepEnv()
-    evaluator.obs = {"processed": "reset"}
-    evaluator.robot_action = None
-    evaluator._video_path = None
-    evaluator._profile_source_observation_id = None
-    evaluator.n_trials = 0
-    evaluator.n_success_trials = 0
-    evaluator.metrics = [_FakeMetric()]
-    evaluator._sync_lights_and_get_obs = lambda obs: obs
-    evaluator._preprocess_obs = lambda obs: {"processed": obs}
-    profiler = _FakeProfiler()
+    result = behavior_profiling.create_behavior_trace_session(
+        output_dir=tmp_path,
+        model_key="model",
+        checkpoint="checkpoint",
+        gpu_ids=[0, 1],
+        task_name="turning_on_radio",
+        policy_name="websocket",
+        host="127.0.0.1",
+        port=8000,
+        power_interval_s=0.1,
+    )
 
-    assert evaluator.step(profiler=profiler, step_index=0) == (False, False)
-    assert evaluator.step(profiler=profiler, step_index=1) == (True, False)
-
-    acts = [event[1] for event in profiler.events if event[0] == "act"]
-    assert all("source_observation_id" not in event and "output_id" not in event for event in acts)
-    readiness = [event[1] for event in profiler.events if event[0] == "readiness_available"]
-    assert [event["source_observation_id"] for event in readiness] == ["observation-0", "observation-1"]
-    assert [event["output_id"] for event in readiness] == ["action-0", "action-1"]
-    assert profiler.events.count("observation") == 2
+    assert result is sentinel
+    assert captured["sample_interval_s"] == 0.1
+    assert captured["gpu_ids"] == [0, 1]
 
 
-def test_main_runs_dedicated_profile_warmup_without_writing_official_result(tmp_path, monkeypatch):
+def test_main_runs_one_unreported_cold_episode_and_delegates_report(tmp_path, monkeypatch):
     args = SimpleNamespace(
         task_name="turning_on_radio",
         host="127.0.0.1",
@@ -525,16 +190,16 @@ def test_main_runs_dedicated_profile_warmup_without_writing_official_result(tmp_
 
     profiler = FakeProfiler()
     monkeypatch.setattr(behavior_profiling, "create_behavior_trace_session", lambda **_kwargs: profiler)
-    monkeypatch.setattr(
-        behavior_profiling,
-        "materialize_cold_start_free_semantic_views",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        behavior_profiling,
-        "summarize_cold_start_free_profile",
-        lambda *_args, **_kwargs: {"coverage": {"warmEpisodes": 2}},
-    )
+    finalized = []
+
+    def finalize(trace_path, *, output_dir):
+        finalized.append((trace_path, output_dir))
+        return {
+            "report": Path(output_dir) / "report/index.html",
+            "data": {"coverage": {"warmEpisodes": 2}},
+        }
+
+    monkeypatch.setattr(behavior_profiling, "finalize_behavior_profile", finalize)
 
     class FakeEvaluator:
         loaded_instances = []
@@ -564,8 +229,8 @@ def test_main_runs_dedicated_profile_warmup_without_writing_official_result(tmp_
 
     assert FakeEvaluator.loaded_instances == [100, 101, 102]
     assert [episode["metadata"]["profiler_warmup"] for episode in profiler.episodes] == [True, False, False]
-    assert [episode["instruction"] for episode in profiler.episodes] == ["Turn on the radio."] * 3
     assert len(profiler.ends) == 3
+    assert finalized == [(profiler.trace_path, Path(args.embodiedperf_output_dir))]
     assert sorted((tmp_path / "results" / "json").glob("*.json")) == [
         tmp_path / "results" / "json" / "turning_on_radio_101_0.json",
         tmp_path / "results" / "json" / "turning_on_radio_102_0.json",

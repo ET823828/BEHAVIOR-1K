@@ -56,8 +56,6 @@ class WebsocketPolicy:
     ) -> None:
         logging.info(f"Creating websocket client policy with host: {host}, port: {port}")
         self.last_action = None
-        self.last_server_timing = None
-        self.last_action_provenance = None
         self.policy = None
         self._allow_reconnect = allow_reconnect
         if host is not None or port is not None:
@@ -66,25 +64,17 @@ class WebsocketPolicy:
     def update_host(self, host: str, port: int) -> None:
         self.policy = WebsocketClientPolicy(host=host, port=port, allow_reconnect=self._allow_reconnect)
         self.last_action = None
-        self.last_server_timing = None
-        self.last_action_provenance = None
 
     def uses_cached_action(self, obs: dict) -> bool:
         return "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None
 
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
         if self.uses_cached_action(obs):
-            self.last_server_timing = None
-            self.last_action_provenance = None
             return self.last_action
         self.last_action = self.policy.act(obs).detach().cpu()
-        self.last_server_timing = self.policy.last_server_timing
-        self.last_action_provenance = self.policy.last_action_provenance
         return self.last_action
 
     def reset(self) -> None:
         if self.policy is not None:
             self.policy.reset()
         self.last_action = None
-        self.last_server_timing = None
-        self.last_action_provenance = None

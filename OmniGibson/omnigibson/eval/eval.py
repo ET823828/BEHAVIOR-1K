@@ -366,26 +366,18 @@ def main() -> None:
         mean_q = (sum(r.get("q_score", {}).get("final", 0.0) for r in results) / n) if n else 0.0
         logger.info(f"Eval summary: {n_success}/{n} success | mean q_score={mean_q:.3f} | task={args.task_name}")
         if profiler is not None:
-            from omnigibson.eval.profiling import (
-                materialize_cold_start_free_semantic_views,
-                summarize_cold_start_free_profile,
-            )
+            from omnigibson.eval.profiling import finalize_behavior_profile
 
             assert profile_dir is not None
-            semantic_views = materialize_cold_start_free_semantic_views(
+            artifacts = finalize_behavior_profile(
                 profiler.trace_path,
-                output_dir=profile_dir / "semantic_timeline",
+                output_dir=profile_dir,
             )
-            summary_path = profile_dir / "summary.json"
-            summary = summarize_cold_start_free_profile(
-                profiler.trace_path,
-                output_path=summary_path,
-                semantic_view_references=semantic_views,
-            )
+            summary = artifacts["data"]
             logger.info(
-                "EmbodiedPerf summary: %s warm episode(s), first episode excluded -> %s",
+                "EmbodiedPerf report: %s warm episode(s), first episode excluded -> %s",
                 summary["coverage"]["warmEpisodes"],
-                summary_path,
+                artifacts["report"],
             )
 
 

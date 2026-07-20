@@ -3,11 +3,9 @@ Adapted from https://github.com/Physical-Intelligence/openpi
 """
 
 import asyncio
-from collections.abc import Mapping
 import functools
 import http
 import logging
-import math
 import msgpack
 import numpy as np
 import requests
@@ -27,56 +25,6 @@ logger.setLevel(logging.INFO)
 
 
 __all__ = ["WebsocketClientPolicy", "WebsocketPolicyServer"]
-
-
-def _normalize_server_timing(value: object) -> dict[str, float] | None:
-    """Keep only the finite duration fields emitted by the challenge policy servers."""
-
-    if not isinstance(value, Mapping):
-        return None
-    normalized = {}
-    for key in ("infer_ms", "prev_total_ms"):
-        item = value.get(key)
-        if item is None:
-            continue
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            return None
-        duration = float(item)
-        if not math.isfinite(duration) or duration < 0:
-            return None
-        normalized[key] = duration
-    return normalized or None
-
-
-def _normalize_action_provenance(value: object) -> dict[str, Any] | None:
-    """Validate the server's causal declaration for the returned action."""
-
-    if not isinstance(value, Mapping) or value.get("schema") != "b1k_action_provenance_v1":
-        return None
-    status = value.get("status")
-    if status not in {"current_observation_used", "current_observation_not_used"}:
-        return None
-    inference_executed = value.get("inference_executed")
-    if type(inference_executed) is not bool:
-        return None
-    if inference_executed != (status == "current_observation_used"):
-        return None
-    normalized: dict[str, Any] = {
-        "schema": "b1k_action_provenance_v1",
-        "status": status,
-        "inference_executed": inference_executed,
-    }
-    for key in ("request_index", "source_request_index", "plan_id", "action_index_in_plan"):
-        item = value.get(key)
-        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-            return None
-        normalized[key] = item
-    if status == "current_observation_used":
-        if normalized["source_request_index"] != normalized["request_index"]:
-            return None
-    elif normalized["source_request_index"] >= normalized["request_index"]:
-        return None
-    return normalized
 
 
 class WebsocketClientPolicy:
@@ -110,16 +58,6 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
-        self._last_server_timing = None
-        self._last_action_provenance = None
-
-    @property
-    def last_server_timing(self) -> dict[str, float] | None:
-        return deepcopy(self._last_server_timing)
-
-    @property
-    def last_action_provenance(self) -> dict[str, Any] | None:
-        return deepcopy(self._last_action_provenance)
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
@@ -163,8 +101,6 @@ class WebsocketClientPolicy:
                 time.sleep(5)
 
     def act(self, obs: Dict) -> th.Tensor:
-        self._last_server_timing = None
-        self._last_action_provenance = None
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
@@ -187,8 +123,6 @@ class WebsocketClientPolicy:
                         )
                         continue
                     raise RuntimeError(f"Server response missing 'action' key: {action_dict}")
-                self._last_server_timing = _normalize_server_timing(action_dict.get("server_timing"))
-                self._last_action_provenance = _normalize_action_provenance(action_dict.get("action_provenance"))
                 action = th.from_numpy(deepcopy(action_dict["action"])).to(th.float32)
                 return action
 
@@ -200,8 +134,6 @@ class WebsocketClientPolicy:
                 raise RuntimeError(f"Websocket connection error: {e}")
 
     def reset(self) -> None:
-        self._last_server_timing = None
-        self._last_action_provenance = None
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
@@ -269,9 +201,6 @@ class WebsocketPolicyServer:
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
-                action_provenance = getattr(self._policy, "last_action_provenance", None)
-                if action_provenance is not None:
-                    action["action_provenance"] = dict(action_provenance)
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
