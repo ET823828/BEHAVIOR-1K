@@ -50,7 +50,7 @@ Install the optional runtime in the existing `behavior` environment:
 ```bash
 conda activate behavior
 python -m pip install \
-  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@d08613c389260177fd31b9fd5fdaf1812d4997ee"
+  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@8f46d6d59480555e0ef795b002b58af78a0bcd4b"
 ```
 
 Keep the baseline policy server running, then enable profiling on the evaluator:
