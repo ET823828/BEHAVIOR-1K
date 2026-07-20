@@ -249,15 +249,11 @@ class Evaluator:
     def load_metrics(self) -> List[MetricBase]:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self, profiler: Any | None = None, step_index: int | None = None) -> Tuple[bool, bool]:
+    def step(self, profiler: Any | None = None) -> Tuple[bool, bool]:
         if profiler is None:
             self.robot_action = self.policy.forward(obs=self.obs)
         else:
-            if isinstance(step_index, bool) or not isinstance(step_index, int) or step_index < 0:
-                raise ValueError("step_index must be a non-negative integer when profiling is enabled")
-            uses_cached_action = getattr(self.policy, "uses_cached_action", None)
-            cached_action = bool(uses_cached_action(self.obs)) if callable(uses_cached_action) else False
-            if cached_action:
+            if self.policy.uses_cached_action(self.obs):
                 self.robot_action = self.policy.forward(obs=self.obs)
             else:
                 with profiler.stage("websocket_policy_round_trip", kind="communication_wait"):
@@ -282,12 +278,6 @@ class Evaluator:
 
         for metric in self.metrics:
             metric.step(self.env, self.robot_action, obs, 0.0, terminated, truncated, info)
-        if profiler is not None:
-            profiler.record_step(
-                terminated=bool(terminated),
-                truncated=bool(truncated),
-                counters={"step_index": step_index + 1},
-            )
         return terminated, truncated
 
     @property

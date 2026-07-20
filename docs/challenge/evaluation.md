@@ -97,7 +97,41 @@ The evaluator sends flattened observations to the policy server. The server shou
 
 Each successful rollout produces a JSON result containing `q_score`, `time`, `agent_distance`, and normalized efficiency metrics. For challenge submissions, run evaluation with `--write-video`; this records the head and wrist camera videos that must be submitted with the rollout metrics.
 
-Optional system profiling is documented in [System profiling with EmbodiedPerf](./profiling.md). It is disabled by default and does not change the challenge result JSON or video format.
+## Optional system profiling
+
+The evaluator can use the separately installed
+[EmbodiedPerf](https://github.com/ET823828/embodiedperf) package to record episode
+latency, WebSocket round trips, environment steps, CPU/GPU utilization, power,
+energy, memory, and a host timeline. Install it in the `behavior` environment:
+
+```bash
+python -m pip install \
+  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@8f46d6d59480555e0ef795b002b58af78a0bcd4b"
+```
+
+Keep the policy server running and add the following arguments to the normal
+evaluator command:
+
+```bash
+python -m omnigibson.eval.eval \
+  --task-name "$TASK_NAME" \
+  --instance-indices 0 1 \
+  --output-dir "$LOG_PATH" \
+  --embodiedperf \
+  --embodiedperf-model-key "$MODEL_KEY" \
+  --embodiedperf-checkpoint "$PATH_TO_CKPT" \
+  --embodiedperf-instruction "$TASK_INSTRUCTION" \
+  --embodiedperf-gpu-ids 0 1
+```
+
+Profiling requires at least two episodes. The first remains a normal challenge
+result but is treated as cold start and excluded from profiler aggregates.
+Artifacts are written to `<output-dir>/embodiedperf/`, with the HTML report at
+`report/index.html`. GPU ids are physical NVML ids; whole-GPU telemetry can
+include a local policy server, while CPU telemetry covers only the evaluator
+process tree. Profiling is disabled by default and does not change result JSON
+or video formats. Enabling `--write-video` includes per-step video work in the
+measured episode.
 
 Example wrappers live under `omnigibson.eval.wrappers`:
 
