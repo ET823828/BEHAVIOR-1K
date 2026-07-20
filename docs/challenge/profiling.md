@@ -18,7 +18,7 @@ The integration records:
   response decoding;
 - every `env.step()` wall interval;
 - evaluator process-tree CPU utilization and RSS;
-- utilization, power, and memory for the explicitly selected whole GPUs;
+- utilization, power, episode energy, and memory for the explicitly selected whole GPUs;
 - one representative host timeline, plus a Perfetto version of that timeline.
 
 Client-side cached actions are not labeled as WebSocket waits. Time outside the
@@ -50,7 +50,7 @@ Install the optional runtime in the existing `behavior` environment:
 ```bash
 conda activate behavior
 python -m pip install \
-  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@89d20acd91adb2011b807fb03980bf7cff439c37"
+  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@d08613c389260177fd31b9fd5fdaf1812d4997ee"
 ```
 
 Keep the baseline policy server running, then enable profiling on the evaluator:
@@ -89,5 +89,6 @@ embodiedperf/
 ```
 
 The finalizer fails rather than replacing missing spans or resource samples with
-zero. The HTML contains aggregate metrics and the first warm episode timeline;
-raw per-episode artifacts remain on disk but are not listed in the report.
+zero. The HTML contains aggregate metrics, including `compute_energy_j` and its
+compatibility alias `energy_proxy_j`, plus the first warm episode timeline. Raw
+per-episode artifacts remain on disk but are not listed in the report.
