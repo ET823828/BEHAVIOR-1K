@@ -109,6 +109,7 @@ nav:
     - Dataset: challenge/dataset.md
     - Baselines: challenge/baselines.md
     - Evaluation and Rules: challenge/evaluation.md
+    - System Profiling: challenge/profiling.md
     - Submission Guidelines: challenge/submission.md
     - Demo Gallery: challenge/tasks/index.md
   - Documentation:

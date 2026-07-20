@@ -312,3 +312,5 @@ python -m omnigibson.eval.eval \
 ```
 
 The evaluator writes per-rollout metrics and videos to `$LOG_PATH`. For the full evaluator flag reference, observation wrappers, and custom robot configurations, see [Evaluation and Rules](./evaluation.md); for preparing a submission, see the [Submission Guidelines](./submission.md).
+
+To collect cold-start-free latency, power, energy, memory, CPU, and timeline artifacts for either baseline, see [System profiling with EmbodiedPerf](./profiling.md).

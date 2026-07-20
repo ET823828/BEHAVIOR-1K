@@ -249,9 +249,26 @@ class Evaluator:
     def load_metrics(self) -> List[MetricBase]:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self) -> Tuple[bool, bool]:
-        self.robot_action = self.policy.forward(obs=self.obs)
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+    def step(self, profiler: Any | None = None, step_index: int | None = None) -> Tuple[bool, bool]:
+        if profiler is None:
+            self.robot_action = self.policy.forward(obs=self.obs)
+        else:
+            if isinstance(step_index, bool) or not isinstance(step_index, int) or step_index < 0:
+                raise ValueError("step_index must be a non-negative integer when profiling is enabled")
+            uses_cached_action = getattr(self.policy, "uses_cached_action", None)
+            cached_action = bool(uses_cached_action(self.obs)) if callable(uses_cached_action) else False
+            if cached_action:
+                self.robot_action = self.policy.forward(obs=self.obs)
+            else:
+                with profiler.stage("websocket_policy_round_trip", kind="communication_wait"):
+                    self.robot_action = self.policy.forward(obs=self.obs)
+
+        if profiler is None:
+            obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        else:
+            with profiler.stage("omnigibson_environment_step", kind="environment_step"):
+                obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+
         obs = self._sync_lights_and_get_obs(obs)
         self.obs = self._preprocess_obs(obs)
 
@@ -265,6 +282,12 @@ class Evaluator:
 
         for metric in self.metrics:
             metric.step(self.env, self.robot_action, obs, 0.0, terminated, truncated, info)
+        if profiler is not None:
+            profiler.record_step(
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+                counters={"step_index": step_index + 1},
+            )
         return terminated, truncated
 
     @property

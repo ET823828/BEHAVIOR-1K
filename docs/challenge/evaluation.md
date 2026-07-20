@@ -97,6 +97,8 @@ The evaluator sends flattened observations to the policy server. The server shou
 
 Each successful rollout produces a JSON result containing `q_score`, `time`, `agent_distance`, and normalized efficiency metrics. For challenge submissions, run evaluation with `--write-video`; this records the head and wrist camera videos that must be submitted with the rollout metrics.
 
+Optional system profiling is documented in [System profiling with EmbodiedPerf](./profiling.md). It is disabled by default and does not change the challenge result JSON or video format.
+
 Example wrappers live under `omnigibson.eval.wrappers`:
 
 <div class="challenge-submission-grid">
