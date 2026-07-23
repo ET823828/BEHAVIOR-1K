@@ -102,11 +102,12 @@ Each successful rollout produces a JSON result containing `q_score`, `time`, `ag
 The evaluator can use the separately installed
 [EmbodiedPerf](https://github.com/ET823828/embodiedperf) package to record episode
 latency, WebSocket round trips, environment steps, CPU/GPU utilization, power,
-energy, memory, and a host timeline. Install it in the `behavior` environment:
+energy, memory, and a host timeline. Install it in the `behavior` environment
+(pin a commit SHA for reproducible deployments):
 
 ```bash
 python -m pip install \
-  "embodiedperf[behavior1k] @ git+https://github.com/ET823828/embodiedperf.git@8f46d6d59480555e0ef795b002b58af78a0bcd4b"
+  "embodiedperf @ git+https://github.com/ET823828/embodiedperf.git@agent/profiler-v1-clean-package"
 ```
 
 Keep the policy server running and add the following arguments to the normal
@@ -118,7 +119,7 @@ python -m omnigibson.eval.eval \
   --instance-indices 0 1 \
   --output-dir "$LOG_PATH" \
   --embodiedperf \
-  --embodiedperf-model-key "$MODEL_KEY" \
+  --embodiedperf-model "$MODEL_KEY" \
   --embodiedperf-checkpoint "$PATH_TO_CKPT" \
   --embodiedperf-instruction "$TASK_INSTRUCTION" \
   --embodiedperf-gpu-ids 0 1

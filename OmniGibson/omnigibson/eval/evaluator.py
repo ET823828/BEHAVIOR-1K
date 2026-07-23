@@ -249,20 +249,20 @@ class Evaluator:
     def load_metrics(self) -> List[MetricBase]:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self, profiler: Any | None = None) -> Tuple[bool, bool]:
-        if profiler is None:
+    def step(self, episode: Any | None = None) -> Tuple[bool, bool]:
+        if episode is None:
             self.robot_action = self.policy.forward(obs=self.obs)
         else:
             if self.policy.uses_cached_action(self.obs):
                 self.robot_action = self.policy.forward(obs=self.obs)
             else:
-                with profiler.stage("websocket_policy_round_trip", kind="communication_wait"):
+                with episode.stage("websocket_policy_round_trip", kind="communication_wait"):
                     self.robot_action = self.policy.forward(obs=self.obs)
 
-        if profiler is None:
+        if episode is None:
             obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
         else:
-            with profiler.stage("omnigibson_environment_step", kind="environment_step"):
+            with episode.stage("omnigibson_environment_step", kind="environment_step"):
                 obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
 
         obs = self._sync_lights_and_get_obs(obs)

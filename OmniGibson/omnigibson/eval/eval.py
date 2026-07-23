@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable optional EmbodiedPerf system profiling (default: False).",
     )
     parser.add_argument(
-        "--embodiedperf-model-key",
+        "--embodiedperf-model",
         default=None,
         help="Stable model identifier recorded in profiler artifacts (required with --embodiedperf).",
     )
@@ -125,7 +125,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Physical GPU ids included in local power/memory accounting (required with --embodiedperf).",
+        help="Physical NVML GPU ids included in whole-device telemetry (required with --embodiedperf).",
+    )
+    parser.add_argument(
+        "--embodiedperf-sample-interval",
+        type=float,
+        default=0.05,
+        help="CPU/GPU sampling interval in seconds (default: 0.05).",
     )
     return parser.parse_args()
 
@@ -142,36 +148,27 @@ def main() -> None:
     logger.info(f"Resolved {args.mode} instance ids for {args.task_name}: {instance_ids}")
 
     profiler = None
-    profile_dir = Path(args.output_dir) / "embodiedperf"
     if args.embodiedperf:
         if args.policy != "websocket":
             raise ValueError("--embodiedperf currently requires --policy websocket")
-        if not isinstance(args.embodiedperf_instruction, str) or not args.embodiedperf_instruction.strip():
-            raise ValueError("--embodiedperf-instruction is required with --embodiedperf")
         if len(instance_ids) * args.num_rollouts <= 1:
             raise ValueError(
                 "EmbodiedPerf excludes the first episode as cold start; select at least two total rollouts"
             )
         try:
-            from embodiedperf.benchmarks.behavior1k import (
-                create_behavior_trace_session,
-                finalize_behavior_profile,
-            )
+            from embodiedperf.integrations.behavior1k import profiler_from_args
         except ImportError as exc:
             raise RuntimeError(
-                "EmbodiedPerf profiling requires embodiedperf[behavior1k] in the evaluator environment"
+                "EmbodiedPerf profiling requires the embodiedperf package in the evaluator environment"
             ) from exc
 
-        profiler = create_behavior_trace_session(
-            output_dir=profile_dir,
-            model_key=args.embodiedperf_model_key,
-            checkpoint=args.embodiedperf_checkpoint,
-            gpu_ids=args.embodiedperf_gpu_ids,
+        profiler = profiler_from_args(
+            args,
+            output_dir=args.output_dir,
             task_name=args.task_name,
             policy_name=args.policy,
             host=args.host,
             port=args.port,
-            sample_interval_s=0.05,
         )
 
     robot_config = None
@@ -228,30 +225,30 @@ def main() -> None:
                         evaluator.start_recording(video_path, rate=args.video_fps)
                     episode_context = (
                         profiler.episode(
-                            task=f"{args.task_name}/instance-{instance_id}",
-                            seed=seed,
-                            instruction=args.embodiedperf_instruction,
-                            init_id=int(instance_id),
-                            task_config=f"{args.mode}/instance-{instance_id}",
+                            f"{args.task_name}/instance-{instance_id}",
+                            metadata={
+                                "instance_id": int(instance_id),
+                                "rollout_id": rollout_id,
+                                "seed": seed,
+                                "task_config": f"{args.mode}/instance-{instance_id}",
+                            },
                         )
                         if profiler is not None
                         else nullcontext()
                     )
-                    with episode_context:
+                    with episode_context as episode:
                         terminated = truncated = False
                         steps = 0
                         while not (terminated or truncated):
-                            terminated, truncated = evaluator.step(profiler=profiler)
+                            terminated, truncated = evaluator.step(episode=episode)
                             steps += 1
 
-                        if profiler is not None:
-                            profiler.finish_measurement()
                         success = bool(evaluator.env.task.success)
+                        if episode is not None:
+                            episode.finish(success=success, metrics={"steps": steps})
                         metrics = {}
                         for metric in evaluator.metrics:
                             metrics.update(metric.aggregate(evaluator.env))
-                        if profiler is not None:
-                            profiler.end(success=success)
 
                     result = {
                         "task": args.task_name,
@@ -279,14 +276,10 @@ def main() -> None:
                         evaluator.stop_recording()
 
         if profiler is not None:
-            artifacts = finalize_behavior_profile(
-                profiler.trace_path,
-                output_dir=profile_dir,
-            )
-            summary = artifacts["data"]
+            artifacts = profiler.finalize()
             logger.info(
                 "EmbodiedPerf report: %s warm episode(s), first episode excluded -> %s",
-                summary["coverage"]["warmEpisodes"],
+                artifacts["data"]["coverage"]["warm_episodes"],
                 artifacts["report"],
             )
 

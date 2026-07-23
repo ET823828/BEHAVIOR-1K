@@ -1,5 +1,4 @@
-from contextlib import contextmanager, nullcontext
-from pathlib import Path
+from contextlib import contextmanager
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -33,14 +32,18 @@ class _FakeMetric:
         return None
 
 
-class _FakeProfiler:
+class _FakeEpisode:
     def __init__(self):
         self.events = []
+        self.finished = []
 
     @contextmanager
     def stage(self, name, *, kind):
         self.events.append((name, kind))
         yield
+
+    def finish(self, *, success, metrics=None):
+        self.finished.append((success, metrics))
 
 
 def _evaluator(*, cached=False):
@@ -58,7 +61,7 @@ def _evaluator(*, cached=False):
     return evaluator
 
 
-def test_evaluator_step_without_profiler_preserves_existing_path():
+def test_evaluator_step_without_episode_preserves_existing_path():
     evaluator = _evaluator()
 
     terminated, truncated = evaluator.step()
@@ -83,11 +86,11 @@ def test_evaluator_step_without_profiler_preserves_existing_path():
 )
 def test_evaluator_profiles_only_real_websocket_calls_and_environment_steps(cached, expected):
     evaluator = _evaluator(cached=cached)
-    profiler = _FakeProfiler()
+    episode = _FakeEpisode()
 
-    evaluator.step(profiler=profiler)
+    evaluator.step(episode=episode)
 
-    assert profiler.events == expected
+    assert episode.events == expected
 
 
 def test_main_profiles_normal_rollouts_and_finalizes_before_shutdown(tmp_path, monkeypatch):
@@ -107,45 +110,56 @@ def test_main_profiles_normal_rollouts_and_finalizes_before_shutdown(tmp_path, m
         video_fps=30,
         headless=True,
         embodiedperf=True,
-        embodiedperf_model_key="model",
+        embodiedperf_model="model",
         embodiedperf_checkpoint="checkpoint",
         embodiedperf_instruction="Turn on the radio.",
         embodiedperf_gpu_ids=[0],
+        embodiedperf_sample_interval=0.05,
     )
     monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
     monkeypatch.setattr(eval_runner, "seed_everything", lambda _seed: 7)
     monkeypatch.setattr(eval_runner, "resolve_instance_ids", lambda _task, indices, *, mode: indices)
 
-    profiler = MagicMock()
-    profiler.trace_path = tmp_path / "results/embodiedperf/traces.jsonl"
-    profiler.episode.side_effect = lambda **_kwargs: nullcontext()
+    episodes = []
     created = []
     finalized = []
     evaluator_closed = False
 
-    api = ModuleType("embodiedperf.benchmarks.behavior1k")
+    profiler = MagicMock()
 
-    def create(**kwargs):
+    @contextmanager
+    def open_episode(name, *, metadata):
+        episode = _FakeEpisode()
+        episodes.append((name, metadata, episode))
+        yield episode
+
+    profiler.episode.side_effect = open_episode
+
+    def finalize():
+        assert not evaluator_closed
+        finalized.append(True)
+        return {
+            "report": tmp_path / "results/embodiedperf/report/index.html",
+            "data": {"coverage": {"warm_episodes": 1}},
+        }
+
+    profiler.finalize.side_effect = finalize
+
+    api = ModuleType("embodiedperf.integrations.behavior1k")
+
+    def profiler_from_args(namespace, **kwargs):
+        assert namespace.embodiedperf_model == "model"
         created.append(kwargs)
         return profiler
 
-    def finalize(trace_path, *, output_dir):
-        assert not evaluator_closed
-        finalized.append((trace_path, output_dir))
-        return {
-            "report": Path(output_dir) / "report/index.html",
-            "data": {"coverage": {"warmEpisodes": 1}},
-        }
-
-    api.create_behavior_trace_session = create
-    api.finalize_behavior_profile = finalize
+    api.profiler_from_args = profiler_from_args
     package = ModuleType("embodiedperf")
     package.__path__ = []
-    benchmarks = ModuleType("embodiedperf.benchmarks")
-    benchmarks.__path__ = []
+    integrations = ModuleType("embodiedperf.integrations")
+    integrations.__path__ = []
     monkeypatch.setitem(sys.modules, "embodiedperf", package)
-    monkeypatch.setitem(sys.modules, "embodiedperf.benchmarks", benchmarks)
-    monkeypatch.setitem(sys.modules, "embodiedperf.benchmarks.behavior1k", api)
+    monkeypatch.setitem(sys.modules, "embodiedperf.integrations", integrations)
+    monkeypatch.setitem(sys.modules, "embodiedperf.integrations.behavior1k", api)
 
     evaluator = MagicMock()
     evaluator.__enter__.return_value = evaluator
@@ -162,15 +176,68 @@ def test_main_profiles_normal_rollouts_and_finalizes_before_shutdown(tmp_path, m
 
     eval_runner.main()
 
-    profile_dir = Path(args.output_dir) / "embodiedperf"
-    assert created[0]["output_dir"] == profile_dir
-    assert created[0]["sample_interval_s"] == 0.05
-    assert profiler.episode.call_count == 2
-    assert profiler.finish_measurement.call_count == 2
-    assert profiler.end.call_count == 2
-    assert finalized == [(profiler.trace_path, profile_dir)]
+    assert created == [
+        {
+            "output_dir": str(tmp_path / "results"),
+            "task_name": "turning_on_radio",
+            "policy_name": "websocket",
+            "host": "127.0.0.1",
+            "port": 8000,
+        }
+    ]
+    assert [name for name, _metadata, _episode in episodes] == [
+        "turning_on_radio/instance-1",
+        "turning_on_radio/instance-2",
+    ]
+    assert [metadata["instance_id"] for _name, metadata, _episode in episodes] == [1, 2]
+    for _name, _metadata, episode in episodes:
+        assert episode.finished == [(True, {"steps": 1})]
+    for call in evaluator.step.call_args_list:
+        assert isinstance(call.kwargs["episode"], _FakeEpisode)
+    assert finalized == [True]
     assert evaluator_closed
     assert sorted((tmp_path / "results/json").glob("*.json")) == [
         tmp_path / "results/json/turning_on_radio_1_0.json",
         tmp_path / "results/json/turning_on_radio_2_0.json",
     ]
+
+
+def test_main_without_embodiedperf_never_touches_profiler(tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        task_name="turning_on_radio",
+        host="127.0.0.1",
+        port=8000,
+        robot_config=None,
+        instance_indices=[1],
+        mode="public_test",
+        num_rollouts=1,
+        max_steps=1,
+        env_wrapper="fake.Wrapper",
+        policy="websocket",
+        output_dir=str(tmp_path / "results"),
+        write_video=False,
+        video_fps=30,
+        headless=True,
+        embodiedperf=False,
+        embodiedperf_model=None,
+        embodiedperf_checkpoint=None,
+        embodiedperf_instruction=None,
+        embodiedperf_gpu_ids=None,
+        embodiedperf_sample_interval=0.05,
+    )
+    monkeypatch.setattr(eval_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(eval_runner, "seed_everything", lambda _seed: 7)
+    monkeypatch.setattr(eval_runner, "resolve_instance_ids", lambda _task, indices, *, mode: indices)
+    monkeypatch.setitem(sys.modules, "embodiedperf", None)
+
+    evaluator = MagicMock()
+    evaluator.__enter__.return_value = evaluator
+    evaluator.env.task.success = True
+    evaluator.metrics = []
+    evaluator.step.return_value = (True, False)
+    monkeypatch.setattr(eval_runner, "Evaluator", lambda _cfg: evaluator)
+
+    eval_runner.main()
+
+    assert evaluator.step.call_args_list[0].kwargs["episode"] is None
+    assert (tmp_path / "results/json/turning_on_radio_1_0.json").is_file()
