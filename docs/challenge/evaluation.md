@@ -107,7 +107,7 @@ energy, memory, and a host timeline. Install it in the `behavior` environment
 
 ```bash
 python -m pip install \
-  "embodiedperf @ git+https://github.com/ET823828/embodiedperf.git@agent/profiler-v1-clean-package"
+  "embodiedperf @ git+https://github.com/ET823828/embodiedperf.git@876aea9da70df0844c6233e613d2f593cac0257f"
 ```
 
 Keep the policy server running and add the following arguments to the normal
@@ -133,6 +133,12 @@ include a local policy server, while CPU telemetry covers only the evaluator
 process tree. Profiling is disabled by default and does not change result JSON
 or video formats. Enabling `--write-video` includes per-step video work in the
 measured episode.
+
+π0.5 and GR00T model-side hooks are available in the maintained
+[`ET823828/BEHAVIOR-1K` model-server kit](https://github.com/ET823828/BEHAVIOR-1K/tree/main/integrations/embodiedperf).
+Those records use the policy server's clock and are not automatically merged
+into the evaluator-local timeline; correlate them with action provenance and
+report matched profiling overhead.
 
 Example wrappers live under `omnigibson.eval.wrappers`:
 

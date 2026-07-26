@@ -184,6 +184,12 @@ uv run scripts/b1k/serve_b1k.py \
 
 This starts a websocket policy server on port 8000. Leave it running and continue to [Evaluation](#evaluation).
 
+For optional model-side EmbodiedPerf stages (BEHAVIOR input packaging, OpenPI
+input encoding, JAX action sampling, and action decode), use the maintained
+[`ET823828/BEHAVIOR-1K` model-server kit](https://github.com/ET823828/BEHAVIOR-1K/tree/main/integrations/embodiedperf).
+The hook entry point replaces only the server command above and keeps the
+normal evaluator command unchanged.
+
 ## GR00T N1.7
 
 This walkthrough fine-tunes [GR00T N1.7](https://huggingface.co/nvidia/GR00T-N1.7-3B) on the challenge dataset using a fork of Isaac-GR00T.
@@ -293,6 +299,13 @@ CUDA_VISIBLE_DEVICES=0 python scripts/b1k/serve_b1k.py \
 ```
 
 This starts a websocket policy server on port 8000, applying temporal ensembling by default; health-check it with `curl -s http://127.0.0.1:8000/healthz`. Leave it running and continue to [Evaluation](#evaluation).
+
+For optional model-side EmbodiedPerf stages (BEHAVIOR input packaging,
+processor/collation, backbone, action head, and action decode), use the
+maintained
+[`ET823828/BEHAVIOR-1K` model-server kit](https://github.com/ET823828/BEHAVIOR-1K/tree/main/integrations/embodiedperf).
+The instrumented server requires the exact task prompt and writes a
+server-clock JSONL trace without changing the evaluator command.
 
 ## Evaluation
 
