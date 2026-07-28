@@ -7,12 +7,14 @@ import numpy as np
 import pytest
 import websockets
 
+from embodiedperf import (
+    REMOTE_PROFILE_KEY,
+    REMOTE_REQUEST_SCHEMA,
+    RemoteStageRecorder,
+)
 from integrations.embodiedperf.model_servers._hooks import (
     InstrumentedWebsocketPolicyServer,
-    SERVER_REQUEST_SCHEMA,
-    SERVER_STAGES_SCHEMA,
     RequestStageLog,
-    StageRecorder,
     _normalize_action_provenance,
     packb,
     unpack_array,
@@ -20,50 +22,10 @@ from integrations.embodiedperf.model_servers._hooks import (
 )
 
 
-def test_stage_recorder_preserves_nested_boundaries() -> None:
-    recorder = StageRecorder(enabled=True)
-    recorder.begin_request(3)
-    with recorder.stage("outer", kind="policy_inference"):
-        with recorder.stage("inner", kind="action_decode"):
-            pass
-
-    collection = recorder.finish_request(request_duration_ms=2.5)
-
-    assert collection is not None
-    assert collection["schema"] == SERVER_STAGES_SCHEMA
-    assert collection["request_index"] == 3
-    assert [stage["name"] for stage in collection["stages"]] == ["outer", "inner"]
-    assert [stage["depth"] for stage in collection["stages"]] == [0, 1]
-    assert all(stage["status"] == "ok" for stage in collection["stages"])
-    assert all(stage["duration_ms"] >= 0 for stage in collection["stages"])
-
-
-def test_stage_recorder_marks_failed_stage_and_recovers() -> None:
-    recorder = StageRecorder(enabled=True)
-    recorder.begin_request(0)
-    with pytest.raises(RuntimeError, match="boom"):
-        with recorder.stage("model", kind="policy_inference"):
-            raise RuntimeError("boom")
-
-    collection = recorder.finish_request(request_duration_ms=1.0)
-
-    assert collection is not None
-    assert collection["stages"][0]["status"] == "error"
-    recorder.begin_request(1)
-    assert recorder.finish_request(request_duration_ms=0.0)["request_index"] == 1
-
-
-def test_disabled_recorder_is_a_noop_without_request() -> None:
-    recorder = StageRecorder(enabled=False)
-    with recorder.stage("ignored", kind="ignored", synchronize=True):
-        pass
-    assert recorder.finish_request(request_duration_ms=float("nan")) is None
-
-
 def test_stage_log_refuses_to_mix_runs(tmp_path) -> None:
     path = tmp_path / "requests.jsonl"
     sink = RequestStageLog(path)
-    sink.append({"schema": SERVER_REQUEST_SCHEMA, "request_index": 0})
+    sink.append({"schema": REMOTE_REQUEST_SCHEMA, "request_index": 0})
 
     assert json.loads(path.read_text(encoding="utf-8"))["request_index"] == 0
     with pytest.raises(FileExistsError):
@@ -113,7 +75,53 @@ def test_action_provenance_rejects_noncausal_buffer_reference() -> None:
         )
 
 
-def test_request_index_survives_websocket_reconnect() -> None:
+def test_disabled_server_omits_remote_profile_contract() -> None:
+    class FakePolicy:
+        last_action_provenance = None
+
+        def reset(self) -> None:
+            pass
+
+        def act(self, _obs: dict) -> np.ndarray:
+            return np.zeros(1, dtype=np.float32)
+
+    class FakeWebsocket:
+        remote_address = ("127.0.0.1", 12345)
+
+        def __init__(self) -> None:
+            self.requests = [packb({"obs": 1})]
+            self.sent: list[bytes] = []
+
+        async def recv(self) -> bytes:
+            if not self.requests:
+                raise websockets.ConnectionClosed(None, None)
+            return self.requests.pop(0)
+
+        async def send(self, message: bytes) -> None:
+            self.sent.append(message)
+
+    websocket = FakeWebsocket()
+    server = InstrumentedWebsocketPolicyServer(
+        policy=FakePolicy(),
+        recorder=RemoteStageRecorder(
+            source="test-policy-server",
+            enabled=False,
+        ),
+        host="127.0.0.1",
+        port=8000,
+    )
+
+    asyncio.run(server._serve_connection(websocket))
+
+    metadata, response = [unpackb(message) for message in websocket.sent]
+    assert "embodiedperf_remote_schema" not in metadata
+    assert REMOTE_PROFILE_KEY not in response
+    assert "action" in response
+
+
+def test_request_index_and_remote_profile_survive_websocket_reconnect(
+    tmp_path,
+) -> None:
     class FakePolicy:
         def __init__(self) -> None:
             self.request_index = 0
@@ -156,11 +164,13 @@ def test_request_index_survives_websocket_reconnect() -> None:
             self.sent.append(message)
 
     policy = FakePolicy()
+    recorder = RemoteStageRecorder(source="test-policy-server")
     server = InstrumentedWebsocketPolicyServer(
         policy=policy,
-        recorder=StageRecorder(enabled=False),
+        recorder=recorder,
         host="127.0.0.1",
         port=8000,
+        stage_log_path=tmp_path / "remote.jsonl",
     )
     first_connection = FakeWebsocket([{"reset": True}, {"obs": 1}, {"obs": 2}])
     second_connection = FakeWebsocket([{"obs": 3}])
@@ -178,3 +188,19 @@ def test_request_index_survives_websocket_reconnect() -> None:
     assert [
         response["action_provenance"]["request_index"] for response in responses
     ] == [0, 1, 2]
+    assert all(
+        response[REMOTE_PROFILE_KEY]["source"] == "test-policy-server"
+        for response in responses
+    )
+    assert [
+        response[REMOTE_PROFILE_KEY]["metadata"]["request_index"]
+        for response in responses
+    ] == [0, 1, 2]
+    assert unpackb(first_connection.sent[0])["embodiedperf_remote_schema"] == (
+        REMOTE_REQUEST_SCHEMA
+    )
+    logged = [
+        json.loads(line)
+        for line in (tmp_path / "remote.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["metadata"]["request_index"] for row in logged] == [0, 1, 2]

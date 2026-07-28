@@ -21,9 +21,9 @@ import numpy as np
 import torch
 import tyro
 
+from embodiedperf import RemoteStageRecorder
 from integrations.embodiedperf.model_servers._hooks import (
     InstrumentedWebsocketPolicyServer,
-    StageRecorder,
 )
 
 
@@ -49,7 +49,12 @@ class ServerConfig:
 class _InstrumentedGr00tPolicy(Gr00tPolicy):
     """Split the upstream GR00T inference pipeline at its real boundaries."""
 
-    def __init__(self, *args: Any, recorder: StageRecorder, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        recorder: RemoteStageRecorder,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._embodiedperf_recorder = recorder
 
@@ -133,7 +138,12 @@ class _InstrumentedGr00tPolicy(Gr00tPolicy):
 
 
 class _InstrumentedB1KPolicyWrapper(B1KPolicyWrapper):
-    def __init__(self, *args: Any, recorder: StageRecorder, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        recorder: RemoteStageRecorder,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._embodiedperf_recorder = recorder
 
@@ -178,7 +188,8 @@ def main(config: ServerConfig) -> None:
     with open(modality_json, encoding="utf-8") as stream:
         modality_config = json.load(stream)
 
-    recorder = StageRecorder(
+    recorder = RemoteStageRecorder(
+        source="gr00t_policy_server",
         enabled=config.embodiedperf_stage_log is not None,
         synchronize=lambda: _cuda_synchronize(config.device),
     )

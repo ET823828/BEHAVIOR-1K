@@ -258,6 +258,13 @@ class Evaluator:
             else:
                 with episode.stage("websocket_policy_round_trip", kind="communication_wait"):
                     self.robot_action = self.policy.forward(obs=self.obs)
+                pop_remote_profile = getattr(
+                    self.policy, "pop_remote_profile", None
+                )
+                if callable(pop_remote_profile):
+                    remote_profile = pop_remote_profile()
+                    if remote_profile is not None:
+                        episode.attach_remote(remote_profile)
 
         if episode is None:
             obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)

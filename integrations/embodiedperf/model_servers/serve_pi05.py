@@ -26,9 +26,9 @@ from openpi.training import config as _config
 import torch
 import tyro
 
+from embodiedperf import RemoteStageRecorder
 from integrations.embodiedperf.model_servers._hooks import (
     InstrumentedWebsocketPolicyServer,
-    StageRecorder,
 )
 
 
@@ -59,7 +59,11 @@ class Args:
 class _InstrumentedPiPolicy:
     """Preserve OpenPI inference while marking its real host-visible phases."""
 
-    def __init__(self, policy: _policy.Policy, recorder: StageRecorder) -> None:
+    def __init__(
+        self,
+        policy: _policy.Policy,
+        recorder: RemoteStageRecorder,
+    ) -> None:
         required = (
             "_input_transform",
             "_output_transform",
@@ -158,7 +162,12 @@ class _InstrumentedPiPolicy:
 
 
 class _InstrumentedB1KPolicyWrapper(B1KPolicyWrapper):
-    def __init__(self, *args: Any, recorder: StageRecorder, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        recorder: RemoteStageRecorder,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._embodiedperf_recorder = recorder
 
@@ -191,7 +200,10 @@ def main(args: Args) -> None:
         config, args.policy.dir, default_prompt=task_prompt
     )
     policy_metadata = policy.metadata
-    recorder = StageRecorder(enabled=args.embodiedperf_stage_log is not None)
+    recorder = RemoteStageRecorder(
+        source="pi05_policy_server",
+        enabled=args.embodiedperf_stage_log is not None,
+    )
     policy = _InstrumentedPiPolicy(policy, recorder)
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")

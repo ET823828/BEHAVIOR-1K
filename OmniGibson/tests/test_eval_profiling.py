@@ -3,21 +3,29 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 import omnigibson.eval.eval as eval_runner
 from omnigibson.eval.evaluator import Evaluator
+from omnigibson.eval.utils.network_utils import WebsocketClientPolicy, packb
 
 
 class _FakePolicy:
-    def __init__(self, *, cached=False):
+    def __init__(self, *, cached=False, remote_profile=None):
         self.cached = cached
+        self.remote_profile = remote_profile
 
     def forward(self, obs):
         return "action"
 
     def uses_cached_action(self, obs):
         return self.cached
+
+    def pop_remote_profile(self):
+        profile = self.remote_profile
+        self.remote_profile = None
+        return profile
 
 
 class _FakeEnv:
@@ -36,6 +44,7 @@ class _FakeEpisode:
     def __init__(self):
         self.events = []
         self.finished = []
+        self.remote_requests = []
 
     @contextmanager
     def stage(self, name, *, kind):
@@ -45,10 +54,13 @@ class _FakeEpisode:
     def finish(self, *, success, metrics=None):
         self.finished.append((success, metrics))
 
+    def attach_remote(self, record):
+        self.remote_requests.append(record)
 
-def _evaluator(*, cached=False):
+
+def _evaluator(*, cached=False, remote_profile=None):
     evaluator = Evaluator.__new__(Evaluator)
-    evaluator.policy = _FakePolicy(cached=cached)
+    evaluator.policy = _FakePolicy(cached=cached, remote_profile=remote_profile)
     evaluator.env = _FakeEnv()
     evaluator.obs = {"processed": True}
     evaluator.robot_action = None
@@ -91,6 +103,62 @@ def test_evaluator_profiles_only_real_websocket_calls_and_environment_steps(cach
     evaluator.step(episode=episode)
 
     assert episode.events == expected
+
+
+def test_evaluator_attaches_remote_profile_after_real_websocket_call():
+    remote_profile = {"schema": "embodiedperf.remote_request.v1"}
+    evaluator = _evaluator(remote_profile=remote_profile)
+    episode = _FakeEpisode()
+
+    evaluator.step(episode=episode)
+
+    assert episode.remote_requests == [remote_profile]
+
+
+def test_websocket_client_extracts_profile_and_rejects_advertised_omission():
+    class FakeWebsocket:
+        def __init__(self, response):
+            self.response = response
+
+        def send(self, _message):
+            pass
+
+        def recv(self):
+            return self.response
+
+    client = WebsocketClientPolicy(host="127.0.0.1")
+    client._server_metadata = {
+        "embodiedperf_remote_schema": "embodiedperf.remote_request.v1"
+    }
+    remote_profile = {"schema": "embodiedperf.remote_request.v1"}
+    client._ws = FakeWebsocket(
+        packb(
+            {
+                "action": np.zeros(1, dtype=np.float32),
+                "_embodiedperf_profile": remote_profile,
+            }
+        )
+    )
+
+    client.act({"obs": 1})
+
+    assert client.pop_remote_profile() == remote_profile
+    assert client.pop_remote_profile() is None
+
+    client._ws = FakeWebsocket(packb({"action": np.zeros(1, dtype=np.float32)}))
+    with pytest.raises(RuntimeError, match="advertised EmbodiedPerf"):
+        client.act({"obs": 2})
+
+    client._ws = FakeWebsocket(
+        packb(
+            {
+                "action": np.zeros(1, dtype=np.float32),
+                "_embodiedperf_profile": {"schema": "wrong"},
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="invalid EmbodiedPerf"):
+        client.act({"obs": 3})
 
 
 def test_main_profiles_normal_rollouts_and_finalizes_before_shutdown(tmp_path, monkeypatch):

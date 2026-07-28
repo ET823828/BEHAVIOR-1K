@@ -73,6 +73,11 @@ class WebsocketPolicy:
         self.last_action = self.policy.act(obs).detach().cpu()
         return self.last_action
 
+    def pop_remote_profile(self) -> dict | None:
+        if self.policy is None:
+            return None
+        return self.policy.pop_remote_profile()
+
     def reset(self) -> None:
         if self.policy is not None:
             self.policy.reset()

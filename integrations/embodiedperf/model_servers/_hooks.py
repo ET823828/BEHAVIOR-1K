@@ -10,8 +10,7 @@ Protocol portions are adapted from OpenPI and Isaac-GR00T (Apache-2.0).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from copy import deepcopy
 import functools
 import http
@@ -22,8 +21,12 @@ from pathlib import Path
 import time
 import traceback
 from typing import Any
-from uuid import uuid4
 
+from embodiedperf import (
+    REMOTE_PROFILE_KEY,
+    REMOTE_REQUEST_SCHEMA,
+    RemoteStageRecorder,
+)
 import msgpack
 import numpy as np
 import websockets
@@ -32,8 +35,6 @@ import websockets.asyncio.server as _server
 
 logger = logging.getLogger(__name__)
 
-SERVER_STAGES_SCHEMA = "embodiedperf.server_stages.v1"
-SERVER_REQUEST_SCHEMA = "embodiedperf.server_request.v1"
 _MAX_ARRAY_BYTES = 256 * 1024 * 1024
 _MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 
@@ -42,140 +43,6 @@ def _non_empty_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value.strip()
-
-
-class StageRecorder:
-    """Collect nested server-clock stages for one synchronous policy request."""
-
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        synchronize: Callable[[], None] | None = None,
-    ) -> None:
-        if not isinstance(enabled, bool):
-            raise TypeError("enabled must be a bool")
-        if synchronize is not None and not callable(synchronize):
-            raise TypeError("synchronize must be callable when provided")
-        self._enabled = enabled
-        self._synchronize = synchronize
-        self._request_index: int | None = None
-        self._request_start_ns: int | None = None
-        self._stack: list[dict[str, Any]] = []
-        self._stages: list[dict[str, Any]] = []
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    def begin_request(self, request_index: int) -> None:
-        if not self._enabled:
-            return
-        if (
-            isinstance(request_index, bool)
-            or not isinstance(request_index, int)
-            or request_index < 0
-        ):
-            raise ValueError("request_index must be a non-negative integer")
-        if self._request_start_ns is not None:
-            raise RuntimeError("a stage request is already active")
-        self._request_index = request_index
-        self._request_start_ns = time.perf_counter_ns()
-        self._stack = []
-        self._stages = []
-
-    @contextmanager
-    def stage(
-        self,
-        name: str,
-        *,
-        kind: str,
-        synchronize: bool = False,
-    ) -> Iterator[None]:
-        """Record one real host boundary, optionally synchronizing its device work."""
-
-        if not self._enabled:
-            yield
-            return
-        if not isinstance(synchronize, bool):
-            raise TypeError("synchronize must be a bool")
-        if self._request_start_ns is None:
-            raise RuntimeError("stage requires an active request")
-        if synchronize and self._synchronize is not None:
-            self._synchronize()
-        stage = {
-            "token": uuid4().hex,
-            "name": _non_empty_text(name, "stage name"),
-            "kind": _non_empty_text(kind, "stage kind"),
-            "start_ns": time.perf_counter_ns(),
-            "depth": len(self._stack),
-        }
-        self._stack.append(stage)
-        status = "ok"
-        try:
-            yield
-        except BaseException:
-            status = "error"
-            raise
-        finally:
-            if synchronize and self._synchronize is not None:
-                self._synchronize()
-            end_ns = time.perf_counter_ns()
-            if not self._stack or self._stack[-1]["token"] != stage["token"]:
-                self.abort_request()
-                raise RuntimeError(
-                    "server stage contexts must close in last-in-first-out order"
-                )
-            self._stack.pop()
-            request_start_ns = self._request_start_ns
-            if request_start_ns is None:
-                raise RuntimeError("server stage request ended unexpectedly")
-            self._stages.append(
-                {
-                    "name": stage["name"],
-                    "kind": stage["kind"],
-                    "start_ms": (stage["start_ns"] - request_start_ns) / 1_000_000.0,
-                    "end_ms": (end_ns - request_start_ns) / 1_000_000.0,
-                    "duration_ms": (end_ns - stage["start_ns"]) / 1_000_000.0,
-                    "depth": stage["depth"],
-                    "status": status,
-                }
-            )
-
-    def finish_request(self, *, request_duration_ms: float) -> dict[str, Any] | None:
-        if not self._enabled:
-            return None
-        if self._request_start_ns is None or self._request_index is None:
-            raise RuntimeError("no stage request is active")
-        if self._stack:
-            raise RuntimeError("cannot finish a request while a server stage is open")
-        if (
-            isinstance(request_duration_ms, bool)
-            or not isinstance(request_duration_ms, (int, float))
-            or not math.isfinite(request_duration_ms)
-            or request_duration_ms < 0
-        ):
-            raise ValueError("request_duration_ms must be finite and non-negative")
-        collection = {
-            "schema": SERVER_STAGES_SCHEMA,
-            "clock": "server_process_perf_counter",
-            "request_index": self._request_index,
-            "request_duration_ms": float(request_duration_ms),
-            "stages": sorted(
-                self._stages, key=lambda item: (item["start_ms"], -item["end_ms"])
-            ),
-        }
-        self._request_index = None
-        self._request_start_ns = None
-        self._stack = []
-        self._stages = []
-        return collection
-
-    def abort_request(self) -> None:
-        self._request_index = None
-        self._request_start_ns = None
-        self._stack = []
-        self._stages = []
 
 
 class RequestStageLog:
@@ -203,14 +70,14 @@ class InstrumentedWebsocketPolicyServer:
         self,
         *,
         policy: Any,
-        recorder: StageRecorder,
+        recorder: RemoteStageRecorder,
         host: str = "0.0.0.0",
         port: int = 8000,
         metadata: Mapping[str, Any] | None = None,
         stage_log_path: str | Path | None = None,
     ) -> None:
-        if not isinstance(recorder, StageRecorder):
-            raise TypeError("recorder must be a StageRecorder")
+        if not isinstance(recorder, RemoteStageRecorder):
+            raise TypeError("recorder must be a RemoteStageRecorder")
         if (
             isinstance(port, bool)
             or not isinstance(port, int)
@@ -227,10 +94,9 @@ class InstrumentedWebsocketPolicyServer:
             RequestStageLog(stage_log_path) if stage_log_path is not None else None
         )
         self._metadata = dict(metadata or {})
-        self._server_session_id = uuid4().hex
-        self._metadata["server_session_id"] = self._server_session_id
+        self._metadata["server_session_id"] = recorder.source_session_id
         if recorder.enabled:
-            self._metadata["embodiedperf_server_stages_schema"] = SERVER_STAGES_SCHEMA
+            self._metadata["embodiedperf_remote_schema"] = REMOTE_REQUEST_SCHEMA
         self._connection_lock = asyncio.Lock()
         self._request_index = 0
         self._reset_index = 0
@@ -279,13 +145,9 @@ class InstrumentedWebsocketPolicyServer:
 
                 obs = deepcopy(result)
                 infer_start = time.monotonic()
-                self._recorder.begin_request(self._request_index)
+                self._recorder.begin_request()
                 action = self._policy.act(obs)
                 infer_ms = (time.monotonic() - infer_start) * 1000.0
-                stages = self._recorder.finish_request(request_duration_ms=infer_ms)
-                if stages is not None:
-                    stages["server_session_id"] = self._server_session_id
-                    stages["reset_index"] = self._reset_index
 
                 action_provenance = _normalize_action_provenance(
                     getattr(self._policy, "last_action_provenance", None)
@@ -300,29 +162,27 @@ class InstrumentedWebsocketPolicyServer:
                 timing = {"infer_ms": infer_ms}
                 if prev_total_time is not None:
                     timing["prev_total_ms"] = prev_total_time * 1000.0
+                remote_profile = self._recorder.finish_request(
+                    metadata={
+                        "reset_index": self._reset_index,
+                        "request_index": self._request_index,
+                        "server_timing": timing,
+                        "action_provenance": action_provenance,
+                    }
+                )
                 response = {
                     "action": _to_numpy(action),
                     "server_timing": timing,
                 }
                 if action_provenance is not None:
                     response["action_provenance"] = action_provenance
-                if stages is not None:
-                    response["embodiedperf_server_stages"] = stages
+                if remote_profile is not None:
+                    response[REMOTE_PROFILE_KEY] = remote_profile
 
                 await websocket.send(packer.pack(response))
                 prev_total_time = time.monotonic() - start_time
-                if self._stage_log is not None:
-                    self._stage_log.append(
-                        {
-                            "schema": SERVER_REQUEST_SCHEMA,
-                            "server_session_id": self._server_session_id,
-                            "reset_index": self._reset_index,
-                            "request_index": self._request_index,
-                            "server_timing": timing,
-                            "action_provenance": action_provenance,
-                            "stage_collection": stages,
-                        }
-                    )
+                if self._stage_log is not None and remote_profile is not None:
+                    self._stage_log.append(remote_profile)
                 self._request_index += 1
             except websockets.ConnectionClosed:
                 self._recorder.abort_request()
@@ -462,12 +322,9 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array)
 
 
 __all__ = [
-    "SERVER_REQUEST_SCHEMA",
-    "SERVER_STAGES_SCHEMA",
     "InstrumentedWebsocketPolicyServer",
     "Packer",
     "RequestStageLog",
-    "StageRecorder",
     "packb",
     "unpackb",
 ]

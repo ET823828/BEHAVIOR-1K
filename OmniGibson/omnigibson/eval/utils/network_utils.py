@@ -23,6 +23,9 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+_EMBODIEDPERF_PROFILE_KEY = "_embodiedperf_profile"
+_EMBODIEDPERF_REMOTE_SCHEMA = "embodiedperf.remote_request.v1"
+
 
 __all__ = ["WebsocketClientPolicy", "WebsocketPolicyServer"]
 
@@ -58,9 +61,22 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
+        self._last_remote_profile = None
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
+
+    def expects_remote_profile(self) -> bool:
+        return (
+            isinstance(self._server_metadata, dict)
+            and self._server_metadata.get("embodiedperf_remote_schema")
+            == _EMBODIEDPERF_REMOTE_SCHEMA
+        )
+
+    def pop_remote_profile(self) -> dict | None:
+        profile = self._last_remote_profile
+        self._last_remote_profile = None
+        return profile
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         parsed = urlparse(self._uri)
@@ -104,6 +120,7 @@ class WebsocketClientPolicy:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
+        self._last_remote_profile = None
         data = self._packer.pack(obs)
         max_retries = 2
         response = None
@@ -116,6 +133,8 @@ class WebsocketClientPolicy:
                     raise RuntimeError(f"Error in inference server:\n{response}")
 
                 action_dict = unpackb(response)
+                if not isinstance(action_dict, dict):
+                    raise RuntimeError("Server response must decode to a mapping")
                 if "action" not in action_dict:
                     if attempt < max_retries:
                         logger.warning(
@@ -123,6 +142,20 @@ class WebsocketClientPolicy:
                         )
                         continue
                     raise RuntimeError(f"Server response missing 'action' key: {action_dict}")
+                remote_profile = action_dict.get(_EMBODIEDPERF_PROFILE_KEY)
+                if self.expects_remote_profile() and remote_profile is None:
+                    raise RuntimeError(
+                        "Server advertised EmbodiedPerf remote profiling but "
+                        "the response omitted its profile"
+                    )
+                if remote_profile is not None and (
+                    not isinstance(remote_profile, dict)
+                    or remote_profile.get("schema") != _EMBODIEDPERF_REMOTE_SCHEMA
+                ):
+                    raise RuntimeError(
+                        "Server returned an invalid EmbodiedPerf remote profile"
+                    )
+                self._last_remote_profile = deepcopy(remote_profile)
                 action = th.from_numpy(deepcopy(action_dict["action"])).to(th.float32)
                 return action
 
@@ -137,6 +170,7 @@ class WebsocketClientPolicy:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
+        self._last_remote_profile = None
         data = self._packer.pack({"reset": True})
         self._ws.send(data)
 
