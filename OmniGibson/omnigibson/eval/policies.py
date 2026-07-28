@@ -64,11 +64,19 @@ class WebsocketPolicy:
     def update_host(self, host: str, port: int) -> None:
         self.policy = WebsocketClientPolicy(host=host, port=port, allow_reconnect=self._allow_reconnect)
 
+    def uses_cached_action(self, obs: dict) -> bool:
+        return "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None
+
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
-        if "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None:
+        if self.uses_cached_action(obs):
             return self.last_action
         self.last_action = self.policy.act(obs).detach().cpu()
         return self.last_action
+
+    def pop_remote_profile(self) -> dict | None:
+        if self.policy is None:
+            return None
+        return self.policy.pop_remote_profile()
 
     def reset(self) -> None:
         if self.policy is not None:

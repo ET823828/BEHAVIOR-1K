@@ -14,6 +14,14 @@ from av.stream import Stream
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
+TORCH_NUM_THREADS = None
+TORCH_NUM_INTEROP_THREADS = None
+
+if TORCH_NUM_THREADS is not None:
+    th.set_num_threads(TORCH_NUM_THREADS)
+if TORCH_NUM_INTEROP_THREADS is not None:
+    th.set_num_interop_threads(TORCH_NUM_INTEROP_THREADS)
+
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from gello.utils.og_teleop_cfg import DISABLED_TRANSITION_RULES
@@ -43,7 +51,6 @@ from omnigibson.utils.bddl_utils import is_system_bddl_inst
 from omnigibson.eval.utils.light_utils import LightToggleSynchronizer, set_light_control_toggles
 from omnigibson.utils.python_utils import recursively_convert_to_torch
 from omnigibson.utils.ui_utils import create_module_logger
-
 
 LIGHT_EVAL_TASKS = {"turning_out_all_lights_before_sleep"}
 EVAL_BASE_LINK_MASS = 250.0
@@ -242,9 +249,29 @@ class Evaluator:
     def load_metrics(self) -> List[MetricBase]:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self) -> Tuple[bool, bool]:
-        self.robot_action = self.policy.forward(obs=self.obs)
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+    def step(self, episode: Any | None = None) -> Tuple[bool, bool]:
+        if episode is None:
+            self.robot_action = self.policy.forward(obs=self.obs)
+        else:
+            if self.policy.uses_cached_action(self.obs):
+                self.robot_action = self.policy.forward(obs=self.obs)
+            else:
+                with episode.stage("websocket_policy_round_trip", kind="communication_wait"):
+                    self.robot_action = self.policy.forward(obs=self.obs)
+                pop_remote_profile = getattr(
+                    self.policy, "pop_remote_profile", None
+                )
+                if callable(pop_remote_profile):
+                    remote_profile = pop_remote_profile()
+                    if remote_profile is not None:
+                        episode.attach_remote(remote_profile)
+
+        if episode is None:
+            obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        else:
+            with episode.stage("omnigibson_environment_step", kind="environment_step"):
+                obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+
         obs = self._sync_lights_and_get_obs(obs)
         self.obs = self._preprocess_obs(obs)
 

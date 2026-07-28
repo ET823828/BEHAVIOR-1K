@@ -97,6 +97,49 @@ The evaluator sends flattened observations to the policy server. The server shou
 
 Each successful rollout produces a JSON result containing `q_score`, `time`, `agent_distance`, and normalized efficiency metrics. For challenge submissions, run evaluation with `--write-video`; this records the head and wrist camera videos that must be submitted with the rollout metrics.
 
+## Optional system profiling
+
+The evaluator can use the separately installed
+[EmbodiedPerf](https://github.com/ET823828/embodiedperf) package to record episode
+latency, WebSocket round trips, environment steps, CPU/GPU utilization, power,
+energy, memory, and a host timeline. Install it in the `behavior` environment
+(pin a commit SHA for reproducible deployments):
+
+```bash
+python -m pip install \
+  "embodiedperf @ git+https://github.com/ET823828/embodiedperf.git@876aea9da70df0844c6233e613d2f593cac0257f"
+```
+
+Keep the policy server running and add the following arguments to the normal
+evaluator command:
+
+```bash
+python -m omnigibson.eval.eval \
+  --task-name "$TASK_NAME" \
+  --instance-indices 0 1 \
+  --output-dir "$LOG_PATH" \
+  --embodiedperf \
+  --embodiedperf-model "$MODEL_KEY" \
+  --embodiedperf-checkpoint "$PATH_TO_CKPT" \
+  --embodiedperf-instruction "$TASK_INSTRUCTION" \
+  --embodiedperf-gpu-ids 0 1
+```
+
+Profiling requires at least two episodes. The first remains a normal challenge
+result but is treated as cold start and excluded from profiler aggregates.
+Artifacts are written to `<output-dir>/embodiedperf/`, with the HTML report at
+`report/index.html`. GPU ids are physical NVML ids; whole-GPU telemetry can
+include a local policy server, while CPU telemetry covers only the evaluator
+process tree. Profiling is disabled by default and does not change result JSON
+or video formats. Enabling `--write-video` includes per-step video work in the
+measured episode.
+
+π0.5 and GR00T model-side hooks are available in the maintained
+[`ET823828/BEHAVIOR-1K` model-server kit](https://github.com/ET823828/BEHAVIOR-1K/tree/main/integrations/embodiedperf).
+Those records use the policy server's clock and are not automatically merged
+into the evaluator-local timeline; correlate them with action provenance and
+report matched profiling overhead.
+
 Example wrappers live under `omnigibson.eval.wrappers`:
 
 <div class="challenge-submission-grid">
